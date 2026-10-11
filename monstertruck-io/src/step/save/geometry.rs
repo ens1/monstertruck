@@ -434,6 +434,10 @@ where
     T1: StepLength + StepFormat,
 {
     fn fmt(&self, idx: usize, f: &mut Formatter<'_>) -> Result {
+        // A guide cannot carry the selected branch in STEP's master 3D representation.
+        if !self.branch_halfspaces().is_empty() {
+            return Err(std::fmt::Error);
+        }
         let curve_idx = idx + 1;
         let boundary0_idx = curve_idx + self.leader().step_length();
         let boundary1_idx = boundary0_idx + self.boundary0().map_or(0, StepLength::step_length);

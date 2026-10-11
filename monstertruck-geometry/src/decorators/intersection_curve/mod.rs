@@ -1,7 +1,15 @@
 use super::*;
 use monstertruck_core::newton::{self, CalcOutput};
 use monstertruck_traits::{ParametricCurve as ParametricCurveTrait, SnapCurveEndpoints};
-use std::ops::Bound;
+mod division;
+
+fn finite_point(point: Point3) -> bool {
+    point.x.is_finite() && point.y.is_finite() && point.z.is_finite()
+}
+
+fn failed_point() -> Point3 { Point3::new(f64::NAN, f64::NAN, f64::NAN) }
+
+fn failed_vector() -> Vector3 { Vector3::new(f64::NAN, f64::NAN, f64::NAN) }
 
 impl<P> SnapCurveEndpoints for Line<P> {}
 
@@ -42,6 +50,13 @@ where
     S0: ParametricSurface3D + SearchNearestParameter<SurfaceParameter, Point = Point3>,
     S1: ParametricSurface3D + SearchNearestParameter<SurfaceParameter, Point = Point3>,
 {
+    if !finite_point(plane_point)
+        || !plane_normal.magnitude2().is_finite()
+        || plane_normal.magnitude2() == 0.0
+    {
+        return None;
+    }
+    let plane_normal = plane_normal.normalize();
     let function = move |Vector4 { x, y, z, w }| {
         let ders0 = surface0.derivatives(1, x, y);
         let (pt0, uder0, vder0) = (ders0[0][0], ders0[1][0], ders0[0][1]);
@@ -73,14 +88,22 @@ where
             // coplanarity), accept the initial guess as a valid intersection point.
             if pt0.near(&pt1) && n0.cross(n1).magnitude() < TOLERANCE {
                 let point = pt0.midpoint(pt1);
-                return Some((point, Point2::new(x, y), Point2::new(z, w)));
+                return (finite_point(point)
+                    && plane_normal.dot(point - plane_point).abs() <= TOLERANCE)
+                    .then_some((point, Point2::new(x, y), Point2::new(z, w)));
             } else {
                 return None;
             }
         }
     };
-    let point = surface0.evaluate(x, y).midpoint(surface1.evaluate(z, w));
-    Some((point, Point2::new(x, y), Point2::new(z, w)))
+    let point0 = surface0.evaluate(x, y);
+    let point1 = surface1.evaluate(z, w);
+    let point = point0.midpoint(point1);
+    (finite_point(point0)
+        && finite_point(point1)
+        && point0.distance2(point1) <= TOLERANCE * TOLERANCE
+        && plane_normal.dot(point - plane_point).abs() <= TOLERANCE)
+        .then_some((point, Point2::new(x, y), Point2::new(z, w)))
 }
 
 impl<C, S0, S1> IntersectionCurve<C, S0, S1> {
@@ -132,7 +155,41 @@ impl<C, S0, S1, T0, T1> SurfaceCurve<C, S0, S1, T0, T1> {
             leader,
             boundary0,
             boundary1,
+            branch_halfspaces: Vec::new(),
         }
+    }
+    /// Retains only intersection points in the positive half-space of this plane.
+    ///
+    /// The normalized plane residual may be negative by at most `TOLERANCE`.
+    /// Constraints accumulate. Invalid origins or zero/non-finite normals return `None`.
+    pub fn with_branch_halfspace(mut self, origin: Point3, normal: Vector3) -> Option<Self> {
+        if !finite_point(origin) || !normal.magnitude2().is_finite() || normal.magnitude2() == 0.0 {
+            return None;
+        }
+        self.branch_halfspaces.push((origin, normal.normalize()));
+        Some(self)
+    }
+    /// Returns the half-space planes restricting the chosen intersection branch.
+    pub fn branch_halfspaces(&self) -> &[(Point3, Vector3)] { &self.branch_halfspaces }
+    /// Preserves branch constraints when changing the leader or boundary representation.
+    ///
+    /// Invalid constraints are retained and cause all subsequent point searches to fail.
+    pub fn with_branch_halfspaces(
+        mut self,
+        planes: impl IntoIterator<Item = (Point3, Vector3)>,
+    ) -> Self {
+        self.branch_halfspaces.extend(planes);
+        self
+    }
+    fn admits_branch_point(&self, point: Point3) -> bool {
+        finite_point(point)
+            && self.branch_halfspaces.iter().all(|(origin, normal)| {
+                let magnitude = normal.magnitude();
+                finite_point(*origin)
+                    && magnitude.is_finite()
+                    && magnitude > 0.0
+                    && normal.dot(point - origin) / magnitude >= -TOLERANCE
+            })
     }
     /// This curve is carried by `self.surface0()` and `self.surface1()`.
     #[inline(always)]
@@ -165,6 +222,8 @@ impl<C, S0, S1, T0, T1> SurfaceCurve<C, S0, S1, T0, T1> {
     #[inline(always)]
     pub fn boundary1_mut(&mut self) -> Option<&mut T1> { self.boundary1.as_mut() }
     /// Destructs `self`, preserving face-local boundaries.
+    ///
+    /// Read [`Self::branch_halfspaces`] first when transferring branch constraints.
     #[inline(always)]
     pub fn destruct_with_boundaries(self) -> (S0, S1, C, Option<T0>, Option<T1>) {
         (
@@ -199,7 +258,6 @@ where
             self.leader.derivative(t),
             trials,
         )
-        .or_else(|| self.search_nearest_point(point, None, None, trials))
     }
     /// Search triple value of the point nearest to `point`.
     /// - the coordinate on 3D space
@@ -253,8 +311,16 @@ where
         let (z, w) = hint1.or_else(|| surface1.search_nearest_parameter(point, hint1, trials))?;
         let Vector4 { x, y, z, w } =
             newton::solve(function, Vector4 { x, y, z, w }, trials).ok()?;
-        let point = surface0.evaluate(x, y).midpoint(surface1.evaluate(z, w));
-        Some((point, Point2::new(x, y), Point2::new(z, w)))
+        let point0 = surface0.evaluate(x, y);
+        let point1 = surface1.evaluate(z, w);
+        (finite_point(point0)
+            && finite_point(point1)
+            && point0.distance2(point1) <= TOLERANCE * TOLERANCE)
+            .then_some((
+                point0.midpoint(point1),
+                Point2::new(x, y),
+                Point2::new(z, w),
+            ))
     }
 }
 
@@ -280,7 +346,7 @@ where
             self.leader.derivative(t),
             trials,
         )
-        .or_else(|| self.search_nearest_point(point, None, None, trials))
+        .filter(|(point, _, _)| self.admits_branch_point(*point))
     }
     /// Search triple value of the point nearest to `point`.
     /// - the coordinate on 3D space
@@ -298,7 +364,9 @@ where
             self.surface1.clone(),
             self.leader.clone(),
         );
-        intersection.search_nearest_point(point, hint0, hint1, trials)
+        intersection
+            .search_nearest_point(point, hint0, hint1, trials)
+            .filter(|(point, _, _)| self.admits_branch_point(*point))
     }
 }
 
@@ -326,9 +394,8 @@ fn curve_der_n(
         .derivative()
         .combinatorial_derivative(&sub, Vector3::dot, n);
     let b = Vector3::new(s0normal.dot(sum0), s1normal.dot(sum1), suml);
-    // SAFETY: the matrix columns are two surface normals and the leader curve tangent,
-    // which are linearly independent at a transversal intersection point.
-    mat.invert().unwrap() * b
+    mat.invert()
+        .map_or_else(failed_vector, |inverse| inverse * b)
 }
 
 fn uv_der_n(
@@ -340,10 +407,9 @@ fn uv_der_n(
 ) -> Vector2 {
     let mat = Matrix3::from_cols(uder, vder, normal);
     let b = cder_n - sum;
-    // SAFETY: the matrix columns are the surface partial derivatives and normal,
-    // which are linearly independent at a regular surface point.
-    let uv_der_n = mat.invert().unwrap() * b;
-    debug_assert!(uv_der_n.z.abs() < 1.0e-4, "{}", uv_der_n.z.abs());
+    let uv_der_n = mat
+        .invert()
+        .map_or_else(failed_vector, |inverse| inverse * b);
     Vector2::new(uv_der_n.x, uv_der_n.y)
 }
 
@@ -378,19 +444,8 @@ where
     type Point = Point3;
     type Vector = Vector3;
     fn evaluate(&self, t: f64) -> Point3 {
-        if let (Bound::Included(t0), Bound::Included(_)) = self.leader.parameter_range()
-            && t.near(&t0)
-        {
-            self.leader.evaluate(t0)
-        } else if let (Bound::Included(_), Bound::Included(t1)) = self.leader.parameter_range()
-            && t.near(&t1)
-        {
-            self.leader.evaluate(t1)
-        } else {
-            self.search_triple(t, 100)
-                .map(|triple| triple.0)
-                .unwrap_or_else(|| self.leader.evaluate(t))
-        }
+        self.search_triple(t, 100)
+            .map_or_else(failed_point, |triple| triple.0)
     }
     fn derivative(&self, t: f64) -> Vector3 {
         let IntersectionCurve {
@@ -401,7 +456,7 @@ where
         let [l, l_der, l_der2] = leader.derivatives(2, t).to_array::<3>();
         let (c, uv0, uv1) = match self.search_triple(t, 100) {
             Some(triple) => triple,
-            None => return leader.derivative(t),
+            None => return failed_vector(),
         };
         let (n0, n1) = (surface0.normal(uv0.x, uv0.y), surface1.normal(uv1.x, uv1.y));
         let n = n0.cross(n1);
@@ -423,9 +478,8 @@ where
         let (c, uv0, uv1) = match self.search_triple(t, 100) {
             Some(triple) => triple,
             None => {
-                let leader_ders = self.leader.derivatives(n, t);
                 let mut cders = CurveDerivatives::new(n);
-                (0..=n).for_each(|i| cders[i] = leader_ders[i]);
+                (0..=n).for_each(|i| cders[i] = failed_vector());
                 return cders;
             }
         };
@@ -470,9 +524,17 @@ where
     S1: ParametricSurface3D + SearchNearestParameter<SurfaceParameter, Point = Point3>,
 {
     type Point = Point3;
-    #[inline(always)]
+    fn try_parameter_division(
+        &self,
+        range: (f64, f64),
+        tol: f64,
+    ) -> Option<(Vec<f64>, Vec<Point3>)> {
+        division::try_divide(self, range, tol)
+    }
     fn parameter_division(&self, range: (f64, f64), tol: f64) -> (Vec<f64>, Vec<Point3>) {
-        algo::curve::parameter_division(self, range, tol)
+        nonpositive_tolerance!(tol);
+        self.try_parameter_division(range, tol)
+            .unwrap_or_else(|| (vec![range.0, range.1], vec![failed_point(); 2]))
     }
 }
 
@@ -559,12 +621,12 @@ where
     }
 }
 
-impl<C: BoundedCurve> IntersectionCurve<C, Plane, Plane> {
+impl<C: ParametricCurve3D + BoundedCurve> IntersectionCurve<C, Plane, Plane> {
     /// Optimizes intersection curve of [`Plane`] into [`Line`].
     #[inline]
-    pub fn optimize(&self) -> Line<C::Point> {
+    pub fn optimize(&self) -> Line<Point3> {
         let (s, t) = self.leader.range_tuple();
-        Line(self.leader.evaluate(s), self.leader.evaluate(t))
+        Line(self.evaluate(s), self.evaluate(t))
     }
 }
 
@@ -579,14 +641,13 @@ where
     type Point = Point3;
     type Vector = Vector3;
     fn evaluate(&self, t: f64) -> Point3 {
-        IntersectionCurve::new(
-            self.surface0.clone(),
-            self.surface1.clone(),
-            self.leader.clone(),
-        )
-        .evaluate(t)
+        self.search_triple(t, 100)
+            .map_or_else(failed_point, |triple| triple.0)
     }
     fn derivative(&self, t: f64) -> Vector3 {
+        if !self.branch_halfspaces.is_empty() && self.search_triple(t, 100).is_none() {
+            return failed_vector();
+        }
         IntersectionCurve::new(
             self.surface0.clone(),
             self.surface1.clone(),
@@ -595,6 +656,9 @@ where
         .derivative(t)
     }
     fn derivative_2(&self, t: f64) -> Vector3 {
+        if !self.branch_halfspaces.is_empty() && self.search_triple(t, 100).is_none() {
+            return failed_vector();
+        }
         IntersectionCurve::new(
             self.surface0.clone(),
             self.surface1.clone(),
@@ -603,6 +667,9 @@ where
         .derivative_2(t)
     }
     fn derivative_n(&self, n: usize, t: f64) -> Vector3 {
+        if !self.branch_halfspaces.is_empty() && self.search_triple(t, 100).is_none() {
+            return failed_vector();
+        }
         IntersectionCurve::new(
             self.surface0.clone(),
             self.surface1.clone(),
@@ -611,6 +678,11 @@ where
         .derivative_n(n, t)
     }
     fn derivatives(&self, n: usize, t: f64) -> CurveDerivatives<Vector3> {
+        if !self.branch_halfspaces.is_empty() && self.search_triple(t, 100).is_none() {
+            let mut result = CurveDerivatives::new(n);
+            (0..=n).for_each(|index| result[index] = failed_vector());
+            return result;
+        }
         IntersectionCurve::new(
             self.surface0.clone(),
             self.surface1.clone(),
@@ -641,9 +713,17 @@ where
     T1: Clone,
 {
     type Point = Point3;
-    #[inline(always)]
+    fn try_parameter_division(
+        &self,
+        range: (f64, f64),
+        tol: f64,
+    ) -> Option<(Vec<f64>, Vec<Point3>)> {
+        division::try_divide(self, range, tol)
+    }
     fn parameter_division(&self, range: (f64, f64), tol: f64) -> (Vec<f64>, Vec<Point3>) {
-        algo::curve::parameter_division(self, range, tol)
+        nonpositive_tolerance!(tol);
+        self.try_parameter_division(range, tol)
+            .unwrap_or_else(|| (vec![range.0, range.1], vec![failed_point(); 2]))
     }
 }
 
@@ -663,6 +743,7 @@ where
             leader: self.leader.cut(t),
             boundary0: self.boundary0.as_mut().map(|boundary| boundary.cut(t)),
             boundary1: self.boundary1.as_mut().map(|boundary| boundary.cut(t)),
+            branch_halfspaces: self.branch_halfspaces.clone(),
         }
     }
 }
@@ -704,7 +785,9 @@ where
             self.surface1.clone(),
             self.leader.clone(),
         );
-        intersection.search_parameter(point, hint, trials)
+        intersection
+            .search_parameter(point, hint, trials)
+            .filter(|t| self.search_triple(*t, trials).is_some())
     }
 }
 
@@ -728,7 +811,9 @@ where
             self.surface1.clone(),
             self.leader.clone(),
         );
-        intersection.search_nearest_parameter(point, hint, trials)
+        intersection
+            .search_nearest_parameter(point, hint, trials)
+            .filter(|t| self.search_triple(*t, trials).is_some())
     }
 }
 
@@ -741,6 +826,14 @@ where
     T1: Transformed<Matrix4>,
 {
     fn transform_by(&mut self, trans: Matrix4) {
+        let normal_transform = trans.invert().map(|inverse| inverse.transpose());
+        self.branch_halfspaces
+            .iter_mut()
+            .for_each(|(origin, normal)| {
+                *origin = trans.transform_point(*origin);
+                *normal = normal_transform
+                    .map_or_else(failed_vector, |inverse| inverse.transform_vector(*normal));
+            });
         self.surface0.transform_by(trans);
         self.surface1.transform_by(trans);
         self.leader.transform_by(trans);

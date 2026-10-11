@@ -34,9 +34,8 @@ impl TryIntoHomogeneousBsplineCurve for Curve3D {
             Curve3D::ParameterCurve(_) => None,
             Curve3D::Polyline(_) => None,
             Curve3D::SurfaceCurve(curve) => curve.leader().try_into_homogeneous_bspline_curve(),
-            Curve3D::IntersectionCurve(curve) => {
-                curve.leader().try_into_homogeneous_bspline_curve()
-            }
+            // Surface intersection guides are not exact rational representations.
+            Curve3D::IntersectionCurve(_) => None,
             Curve3D::NurbsCurve(curve) => curve.try_into_homogeneous_bspline_curve(),
         }
     }

@@ -166,6 +166,16 @@ impl Transformed<Matrix4> for Curve {
 
 impl ParameterDivision1D for Curve {
     type Point = Point3;
+    fn try_parameter_division(
+        &self,
+        range: (f64, f64),
+        tol: f64,
+    ) -> Option<(Vec<f64>, Vec<Self::Point>)> {
+        match self {
+            Curve::IntersectionCurve(curve) => curve.try_parameter_division(range, tol),
+            _ => (tol.is_finite() && tol >= TOLERANCE).then(|| self.parameter_division(range, tol)),
+        }
+    }
     fn parameter_division(&self, range: (f64, f64), tol: f64) -> (Vec<f64>, Vec<Self::Point>) {
         let debug_profile = env::var("MT_PROFILE_CURVE_DIVISION").is_ok();
         let started = Instant::now();
@@ -175,7 +185,7 @@ impl ParameterDivision1D for Curve {
                 .unwrap_or_else(|| curve.parameter_division(range, tol)),
             Curve::NurbsCurve(curve) => curve.parameter_division(range, tol),
             Curve::ParameterCurve(curve) => curve.parameter_division(range, tol),
-            Curve::IntersectionCurve(curve) => curve.leader().parameter_division(range, tol),
+            Curve::IntersectionCurve(curve) => curve.parameter_division(range, tol),
         };
         if debug_profile {
             let kind = match self {
@@ -251,14 +261,18 @@ impl
             ParameterCurve<BoundaryCurve2D, Surface>,
         >,
     ) -> Curve {
+        let branches = c.branch_halfspaces().to_vec();
         let (surface0, surface1, leader, boundary0, boundary1) = c.destruct_with_boundaries();
-        Curve::IntersectionCurve(SurfaceCurve::with_boundaries(
-            Box::new(surface0),
-            Box::new(surface1),
-            Box::new(leader.into()),
-            boundary0.map(boundary_curve_2d_to_model_curve),
-            boundary1.map(boundary_curve_2d_to_model_curve),
-        ))
+        Curve::IntersectionCurve(
+            SurfaceCurve::with_boundaries(
+                Box::new(surface0),
+                Box::new(surface1),
+                Box::new(leader.into()),
+                boundary0.map(boundary_curve_2d_to_model_curve),
+                boundary1.map(boundary_curve_2d_to_model_curve),
+            )
+            .with_branch_halfspaces(branches),
+        )
     }
 }
 
@@ -282,14 +296,18 @@ impl
             ParameterCurve<BoundaryCurve2D, Surface>,
         >,
     ) -> Curve {
+        let branches = c.branch_halfspaces().to_vec();
         let (surface0, surface1, leader, boundary0, boundary1) = c.destruct_with_boundaries();
-        Curve::IntersectionCurve(SurfaceCurve::with_boundaries(
-            Box::new(surface0),
-            Box::new(surface1),
-            Box::new(leader.into()),
-            boundary0.map(boundary_curve_2d_to_model_curve),
-            boundary1.map(boundary_curve_2d_to_model_curve),
-        ))
+        Curve::IntersectionCurve(
+            SurfaceCurve::with_boundaries(
+                Box::new(surface0),
+                Box::new(surface1),
+                Box::new(leader.into()),
+                boundary0.map(boundary_curve_2d_to_model_curve),
+                boundary1.map(boundary_curve_2d_to_model_curve),
+            )
+            .with_branch_halfspaces(branches),
+        )
     }
 }
 
@@ -309,7 +327,10 @@ impl ToSameGeometry<Curve> for BsplineCurve<Point3> {
 }
 
 impl Curve {
-    /// Into non-ratinalized 4-dimensional B-spline curve
+    /// Converts to a non-rationalized 4-dimensional B-spline curve.
+    ///
+    /// Parameter and intersection curves are sampled approximations. Use
+    /// [`TryIntoHomogeneousBsplineCurve`] when an exact representation is required.
     pub fn lift_up(&self) -> BsplineCurve<Vector4> {
         match self {
             Curve::Line(curve) => Curve::BsplineCurve((*curve).into()).lift_up(),
@@ -323,7 +344,9 @@ impl Curve {
             ),
             Curve::NurbsCurve(curve) => curve.non_rationalized().clone(),
             Curve::ParameterCurve(curve) => sample_curve_to_nurbs(curve).non_rationalized().clone(),
-            Curve::IntersectionCurve(curve) => curve.leader().lift_up(),
+            Curve::IntersectionCurve(curve) => {
+                sample_curve_to_nurbs(curve).non_rationalized().clone()
+            }
         }
     }
 }
@@ -438,7 +461,8 @@ impl TryIntoHomogeneousBsplineCurve for Curve {
             Curve::BsplineCurve(curve) => curve.try_into_homogeneous_bspline_curve(),
             Curve::NurbsCurve(curve) => curve.try_into_homogeneous_bspline_curve(),
             Curve::ParameterCurve(_) => None,
-            Curve::IntersectionCurve(curve) => curve.leader().try_into_homogeneous_bspline_curve(),
+            // The leader guides surface projection; it is not the intersection itself.
+            Curve::IntersectionCurve(_) => None,
         }
     }
 
@@ -523,26 +547,28 @@ impl ParameterBoundary2D<Surface> for Curve {
             Curve::ParameterCurve(curve) => same_surface(curve.surface().as_ref(), surface)
                 .then(|| parameter_curve_points(curve, tolerance)),
             Curve::IntersectionCurve(curve) => {
-                if let Some(boundary) = curve.boundary0().filter(|boundary| {
-                    boundary_matches_surface_curve(curve.leader().as_ref(), boundary, surface)
-                }) {
+                if let Some(boundary) = curve
+                    .boundary0()
+                    .filter(|boundary| boundary_matches_surface_curve(self, boundary, surface))
+                {
                     Some(parameter_curve_points(boundary, tolerance))
-                } else if let Some(boundary) = curve.boundary1().filter(|boundary| {
-                    boundary_matches_surface_curve(curve.leader().as_ref(), boundary, surface)
-                }) {
+                } else if let Some(boundary) = curve
+                    .boundary1()
+                    .filter(|boundary| boundary_matches_surface_curve(self, boundary, surface))
+                {
                     Some(parameter_curve_points(boundary, tolerance))
                 } else if same_surface(curve.surface0().as_ref(), surface) {
                     curve
                         .boundary0()
                         .map(|boundary| parameter_curve_points(boundary, tolerance))
-                        .or_else(|| curve.leader().parameter_boundary_2d(surface, tolerance))
+                        .or_else(|| sampled_parameter_boundary(self, surface, tolerance))
                 } else if same_surface(curve.surface1().as_ref(), surface) {
                     curve
                         .boundary1()
                         .map(|boundary| parameter_curve_points(boundary, tolerance))
-                        .or_else(|| curve.leader().parameter_boundary_2d(surface, tolerance))
+                        .or_else(|| sampled_parameter_boundary(self, surface, tolerance))
                 } else {
-                    sampled_parameter_boundary(curve.leader().as_ref(), surface, tolerance)
+                    sampled_parameter_boundary(self, surface, tolerance)
                 }
             }
         }
@@ -561,16 +587,10 @@ impl ExactParameterBoundary2D<Surface> for Curve {
                 Some(curve.clone())
             }
             Curve::IntersectionCurve(curve) if same_surface(curve.surface0().as_ref(), surface) => {
-                curve
-                    .boundary0()
-                    .cloned()
-                    .or_else(|| curve.leader().exact_parameter_boundary_2d(surface))
+                curve.boundary0().cloned()
             }
             Curve::IntersectionCurve(curve) if same_surface(curve.surface1().as_ref(), surface) => {
-                curve
-                    .boundary1()
-                    .cloned()
-                    .or_else(|| curve.leader().exact_parameter_boundary_2d(surface))
+                curve.boundary1().cloned()
             }
             _ => None,
         }

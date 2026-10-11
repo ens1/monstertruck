@@ -62,7 +62,14 @@ impl IncludeCurve<Curve3D> for Plane {
                 Surface::ElementarySurface(ElementarySurface::Plane(surface)) if self == surface
             ),
             Curve3D::SurfaceCurve(curve) => self.include(curve.leader()),
-            Curve3D::IntersectionCurve(curve) => self.include(curve.leader().as_ref()),
+            Curve3D::IntersectionCurve(curve) => [curve.surface0(), curve.surface1()]
+                .into_iter()
+                .any(|surface| {
+                    matches!(
+                        surface.as_ref(),
+                        Surface::ElementarySurface(ElementarySurface::Plane(plane)) if plane == self
+                    )
+                }),
         }
     }
 }

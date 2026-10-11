@@ -281,6 +281,10 @@ pub struct EdgeBlendSurface<C0, S0, F0, C1, S1, F1> {
 /// let length = sum / 100.0 / 2.0;
 /// assert!(f64::abs(length - PI) < 1.0e-4 * PI);
 /// ```
+/// Evaluation projects the leader onto both carriers, including at range endpoints.
+/// Failed or singular projection produces non-finite values rather than leader geometry.
+/// Use [`IntersectionCurve::search_triple`] for fallible point evaluation and
+/// [`ParameterDivision1D::try_parameter_division`] for fallible, bounded tessellation.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, SelfSameGeometry)]
 pub struct IntersectionCurve<C, S0, S1> {
     surface0: S0,
@@ -289,6 +293,9 @@ pub struct IntersectionCurve<C, S0, S1> {
 }
 
 /// Surface curve with exact face-local boundaries on both supporting surfaces.
+///
+/// Its 3D evaluation and fallible tessellation have the same projection and failure
+/// semantics as [`IntersectionCurve`]; its leader is not a geometric substitute.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, SelfSameGeometry)]
 pub struct SurfaceCurve<C, S0, S1, T0, T1> {
     surface0: S0,
@@ -296,6 +303,8 @@ pub struct SurfaceCurve<C, S0, S1, T0, T1> {
     leader: C,
     boundary0: Option<T0>,
     boundary1: Option<T1>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    branch_halfspaces: Vec<(Point3, Vector3)>,
 }
 
 /// trimmed curve for parametric curve

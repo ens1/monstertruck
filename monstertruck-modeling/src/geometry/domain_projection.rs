@@ -462,7 +462,9 @@ pub(super) fn sampled_parameter_boundary(
     surface: &Surface,
     tolerance: f64,
 ) -> Option<Vec<Point2>> {
-    let points = curve.parameter_division(curve.range_tuple(), tolerance).1;
+    let points = curve
+        .try_parameter_division(curve.range_tuple(), tolerance)?
+        .1;
     let sample_count = points.len();
     let domain = SurfaceParameterDomain::of(surface);
     record_projection(|census| *census = ProjectionCensus::default());

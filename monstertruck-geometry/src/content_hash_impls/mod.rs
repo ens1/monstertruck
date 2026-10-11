@@ -169,6 +169,13 @@ impl<
         self.surface1().content_hash(state);
         self.boundary0().content_hash(state);
         self.boundary1().content_hash(state);
+        self.branch_halfspaces().len().content_hash(state);
+        self.branch_halfspaces()
+            .iter()
+            .for_each(|(origin, normal)| {
+                origin.content_hash(state);
+                normal.content_hash(state);
+            });
     }
 }
 

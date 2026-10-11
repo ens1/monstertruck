@@ -157,7 +157,7 @@ impl ParameterDivision1D for Curve3D {
             Curve3D::BsplineCurve(curve) => curve.try_parameter_division(range, tol),
             Curve3D::ParameterCurve(curve) => curve.try_parameter_division(range, tol),
             Curve3D::SurfaceCurve(curve) => curve.try_parameter_division(range, tol),
-            Curve3D::IntersectionCurve(curve) => curve.leader().try_parameter_division(range, tol),
+            Curve3D::IntersectionCurve(curve) => curve.try_parameter_division(range, tol),
             Curve3D::NurbsCurve(curve) => curve.try_parameter_division(range, tol),
         };
         if let Some(started) = started {
@@ -193,7 +193,7 @@ impl ParameterDivision1D for Curve3D {
             Curve3D::BsplineCurve(curve) => curve.parameter_division(range, tol),
             Curve3D::ParameterCurve(curve) => curve.parameter_division(range, tol),
             Curve3D::SurfaceCurve(curve) => curve.parameter_division(range, tol),
-            Curve3D::IntersectionCurve(curve) => curve.leader().parameter_division(range, tol),
+            Curve3D::IntersectionCurve(curve) => curve.parameter_division(range, tol),
             Curve3D::NurbsCurve(curve) => curve.parameter_division(range, tol),
         };
         if let Some(started) = started {
