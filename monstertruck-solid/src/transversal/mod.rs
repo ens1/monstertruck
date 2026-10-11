@@ -5,8 +5,8 @@
 #[cfg(feature = "marching-ssi")]
 mod classic;
 mod integrate;
-// Marching-SSI polyline chaining support consumed by the classic backend.
-#[cfg(feature = "marching-ssi")]
+// Retained legacy chaining fixtures; production uses the checked classic assembler.
+#[cfg(all(feature = "marching-ssi", test))]
 mod polyline_construction;
 pub use integrate::{
     PlaneCut, ShapeOpsCurve, ShapeOpsError, ShapeOpsSurface, ShellOrientationHints, and,

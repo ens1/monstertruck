@@ -134,8 +134,66 @@ where
 #[derive(Debug, Error)]
 pub enum ShapeOpsError {
     /// `tol` was not positive enough for robust meshing and projection.
-    #[error("`tol` must be at least `TOLERANCE`.")]
+    #[error("`tol` must be finite and at least `TOLERANCE`.")]
     InvalidTolerance,
+    /// An input boundary is not a connected, closed manifold.
+    #[error("invalid input shell {shell_index} in operand {operand_index}: {source}.")]
+    InvalidInputShell {
+        /// Zero-based input operand index.
+        operand_index: usize,
+        /// Zero-based boundary shell index within the operand.
+        shell_index: usize,
+        /// Topology validation error.
+        #[source]
+        source: TopologyError,
+    },
+    /// An input face could not supply a finite classification mesh.
+    #[error(
+        "failed to tessellate face {face_index} of operand {shell_index} for boolean classification."
+    )]
+    ClassificationMeshFailed {
+        /// Zero-based input operand index.
+        shell_index: usize,
+        /// Zero-based face index within the combined input shells.
+        face_index: usize,
+    },
+    /// The signed material volume cannot reliably determine the input orientation.
+    #[error("could not determine the material orientation of operand {shell_index}.")]
+    ShellOrientationFailed {
+        /// Zero-based input operand index.
+        shell_index: usize,
+    },
+    /// The intersection tracing or intersection-loop assembly failed.
+    #[error(
+        "failed to construct surface intersection loops; contact or coincident boundaries may require a dedicated operation."
+    )]
+    IntersectionLoopsFailed,
+    /// An unknown face has no safely classifiable interior sample.
+    #[error(
+        "could not classify face {face_index} of operand {shell_index} away from the other boundary at the requested tolerance."
+    )]
+    AmbiguousFaceClassification {
+        /// Zero-based input operand index.
+        shell_index: usize,
+        /// Zero-based unknown face index after division.
+        face_index: usize,
+    },
+    /// A bounded operation budget was exhausted before producing a valid result.
+    #[error("boolean resource limit reached during {stage} (limit {limit}).")]
+    ResourceLimit {
+        /// Pipeline stage and resource being bounded.
+        stage: &'static str,
+        /// Maximum resource count allowed by the stage.
+        limit: usize,
+    },
+    /// The universal set has no finite boundary representation in `Solid`.
+    #[error(
+        "`{operation}` produces the universal set, which cannot be represented as a boundary solid."
+    )]
+    UnboundedResult {
+        /// Boolean operation name.
+        operation: &'static str,
+    },
     /// `world_to_clip` could not be inverted.
     #[error("`world_to_clip` must be invertible for `clip_half_space_z`.")]
     NonInvertibleClipTransform,
@@ -221,10 +279,10 @@ const HALF_SPACE_CLIP_OPERATION: &str = "clip_half_space_z";
 
 /// Orientation hints for the combined input shells of a boolean operation.
 ///
-/// `monstertruck-solid` normally derives shell orientation by tessellating the
-/// full input shells and measuring signed volume. When the caller already knows
-/// whether either combined shell is inverted, passing these hints avoids that
-/// extra global polyline conversion work.
+/// `monstertruck-solid` normally derives material orientation from the signed
+/// volume of its classification meshes. A hint supplies the orientation when
+/// it is already known. It does not remove the tessellation required for
+/// intersection tracing and face classification.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ShellOrientationHints {
     /// Whether the first combined shell is inverted.
@@ -263,9 +321,8 @@ where
 
 /// AND operation between two solids with known combined-shell orientation.
 ///
-/// This is a performance-oriented variant of [`and`] for callers that already
-/// know whether either input solid's combined shell is inverted. It avoids the
-/// fallback full-shell tessellation used only to recover shell orientation.
+/// This variant of [`and`] accepts the known orientation of each complete
+/// material domain. Classification meshes are still built for both operands.
 ///
 /// Passing wrong hints can misclassify faces and produce invalid output.
 pub fn and_with_orientation_hints<C: CuttableTrimAwareShapeOpsCurve<S>, S: ShapeOpsSurface>(
@@ -287,10 +344,7 @@ where
 {
     #[cfg(feature = "marching-ssi")]
     {
-        // The classic backend does not consume orientation hints; it derives
-        // shell orientation from tessellated signed volume internally.
-        let _ = orientation_hints;
-        classic::and(solid0, solid1, tol)
+        classic::and_with_orientation_hints(solid0, solid1, Some(orientation_hints), tol)
     }
     #[cfg(not(feature = "marching-ssi"))]
     {
@@ -487,7 +541,7 @@ where
         + ExactTrimBoundary2D
         + Parallelizable,
 {
-    if tol < TOLERANCE {
+    if !tol.is_finite() || tol < TOLERANCE {
         return Err(ShapeOpsError::InvalidTolerance);
     }
     let clip_to_world = world_to_clip
@@ -496,9 +550,7 @@ where
     let clip_solid = transformed_solid(solid, world_to_clip);
     let bounds = solid_bounds(&clip_solid);
     if bounds.is_empty() || half_space_discards_bounds(bounds, keep_positive_z, tol) {
-        return Err(ShapeOpsError::EmptyOutputShell {
-            operation: HALF_SPACE_CLIP_OPERATION,
-        });
+        return Ok(Solid::empty());
     }
     if half_space_contains_bounds(bounds, keep_positive_z, tol) {
         return Ok(solid.clone());

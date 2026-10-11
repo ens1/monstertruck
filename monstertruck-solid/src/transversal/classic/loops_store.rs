@@ -60,15 +60,37 @@ impl ShapesOpStatus {
         S0: ParametricSurface3D + SearchNearestParameter<SurfaceParameter, Point = Point3>,
         S1: ParametricSurface3D + SearchNearestParameter<SurfaceParameter, Point = Point3>, {
         let (t0, t1) = curve.range_tuple();
-        let t = (t0 + t1) / 2.0;
-        let (_, pt0, pt1) = curve.search_triple(t, 100)?;
-        let der = curve.leader().derivative(t);
-        let normal0 = curve.surface0().normal(pt0[0], pt0[1]);
-        let normal1 = curve.surface1().normal(pt1[0], pt1[1]);
-        match normal0.cross(der).dot(normal1) > 0.0 {
-            true => Some(ShapesOpStatus::Or),
-            false => Some(ShapesOpStatus::And),
+        let mut resolved = None;
+        for fraction in [0.25, 0.5, 0.75] {
+            let t = t0 + (t1 - t0) * fraction;
+            let (_, pt0, pt1) = curve.search_triple(t, 100)?;
+            let der = curve.leader().derivative(t);
+            let normal0 = curve.surface0().normal(pt0.x, pt0.y);
+            let normal1 = curve.surface1().normal(pt1.x, pt1.y);
+            let denominator = normal0.magnitude() * der.magnitude() * normal1.magnitude();
+            if !denominator.is_finite() || denominator <= 0.0 {
+                return None;
+            }
+            let direction = normal0.cross(der).dot(normal1) / denominator;
+            // Tangent/coincident contacts have no transversal inside/outside
+            // direction; assigning them And by default invents material.
+            if !direction.is_finite() {
+                return None;
+            }
+            if direction.abs() <= 1.0e-10 {
+                continue;
+            }
+            let status = if direction > 0.0 {
+                ShapesOpStatus::Or
+            } else {
+                ShapesOpStatus::And
+            };
+            if resolved.is_some_and(|old| old != status) {
+                return None;
+            }
+            resolved = Some(status);
         }
+        resolved
     }
 }
 
@@ -146,30 +168,27 @@ enum ParameterKind {
     Inner(f64),
 }
 
-impl ParameterKind {
-    fn try_new(t: f64, (t0, t1): (f64, f64)) -> Option<ParameterKind> {
-        if t0.near(&t) {
-            Some(ParameterKind::Front)
-        } else if t1.near(&t) {
-            Some(ParameterKind::Back)
-        } else if t0 < t && t < t1 {
-            Some(ParameterKind::Inner(t))
-        } else {
-            None
-        }
-    }
-}
-
 impl<P: Copy, C: Clone> Loops<P, C> {
     fn search_parameter(&self, pt: P) -> Option<(usize, usize, ParameterKind)>
-    where C: BoundedCurve<Point = P> + SearchParameter<CurveParameter, Point = P> {
+    where
+        P: Tolerance,
+        C: BoundedCurve<Point = P> + SearchParameter<CurveParameter, Point = P>, {
         self.iter()
             .enumerate()
             .flat_map(move |(i, wire)| wire.iter().enumerate().map(move |(j, edge)| (i, j, edge)))
             .find_map(|(i, j, edge)| {
                 let curve = edge.curve();
-                curve.search_parameter(pt, None, 1).and_then(|t| {
-                    let kind = ParameterKind::try_new(t, curve.range_tuple())?;
+                curve.search_parameter(pt, None, 100).and_then(|t| {
+                    let (start, end) = curve.range_tuple();
+                    let kind = if pt.near(&curve.front()) {
+                        ParameterKind::Front
+                    } else if pt.near(&curve.back()) {
+                        ParameterKind::Back
+                    } else if t.is_finite() && start < t && t < end {
+                        ParameterKind::Inner(t)
+                    } else {
+                        return None;
+                    };
                     Some((i, j, kind))
                 })
             })
@@ -348,12 +367,14 @@ impl<C> LoopsStore<Point3, C> {
         kind: ParameterKind,
         another_surface: &S,
         emap: &mut HashMap<EdgeId<C>, Edge<Point3, C>>,
+        tol: f64,
     ) -> Option<()>
     where
         C: Cut<Point = Point3, Vector = Vector3>
             + SearchNearestParameter<CurveParameter, Point = Point3>,
         S: ParametricSurface3D + SearchNearestParameter<SurfaceParameter, Point = Point3>,
     {
+        let seed = v.point();
         match kind {
             ParameterKind::Front => {
                 let old_vertex = self[loops_index][wire_index][edge_index]
@@ -381,7 +402,14 @@ impl<C> LoopsStore<Point3, C> {
                 self.swap_edge_into_wire(edge_id, &new_wire);
             }
         }
-        Some(())
+        let point = v.point();
+        if !super::finite_point(point) || point.distance(seed) > 4.0 * tol {
+            return None;
+        }
+        let uv = another_surface.search_nearest_parameter(point, None, 100)?;
+        let on_surface = another_surface.subs(uv.0, uv.1);
+        let residual = TOLERANCE;
+        (super::finite_point(on_surface) && point.distance(on_surface) <= residual).then_some(())
     }
 }
 
@@ -394,31 +422,72 @@ fn curve_surface_projection<C, S>(
     trials: usize,
 ) -> Option<(Point3, f64, Point2)>
 where
-    C: ParametricCurve3D + SearchNearestParameter<CurveParameter, Point = Point3>,
+    C: ParametricCurve3D + BoundedCurve + SearchNearestParameter<CurveParameter, Point = Point3>,
     S: ParametricSurface3D + SearchNearestParameter<SurfaceParameter, Point = Point3>,
 {
-    if trials == 0 {
+    let (start, end) = curve.range_tuple();
+    if !start.is_finite() || !end.is_finite() || end <= start || !super::finite_point(point) {
         return None;
     }
-    let t = curve.search_nearest_parameter(point, curve_hint, 10)?;
-    let pt0 = curve.evaluate(t);
-    let (u, v) = surface.search_nearest_parameter(point, surface_hint, 10)?;
-    let pt1 = surface.evaluate(u, v);
-    if point.near(&pt0) && point.near(&pt1) && pt0.near(&pt1) {
-        Some((point, t, Point2::new(u, v)))
-    } else {
-        let l = curve.derivative(t);
-        let n = surface.normal(u, v);
-        let t0 = (pt1 - pt0).dot(n) / l.dot(n);
-        curve_surface_projection(
-            curve,
-            Some(t),
-            surface,
-            Some((u, v)),
-            pt0 + t0 * l,
-            trials - 1,
-        )
+    let mut t = curve
+        .search_nearest_parameter(point, curve_hint, 100)?
+        .clamp(start, end);
+    let mut hint = surface_hint;
+    for _ in 0..trials.min(100) {
+        let on_curve = curve.subs(t);
+        if !super::finite_point(on_curve) {
+            return None;
+        }
+        let uv = surface.search_nearest_parameter(on_curve, hint, 100)?;
+        if !uv.0.is_finite() || !uv.1.is_finite() {
+            return None;
+        }
+        let on_surface = surface.subs(uv.0, uv.1);
+        let distance = on_surface.distance(on_curve);
+        let tolerance = TOLERANCE;
+        if distance.is_finite() && distance <= tolerance {
+            return Some((on_curve, t, uv.into()));
+        }
+        if !distance.is_finite() {
+            return None;
+        }
+        let tangent = curve.derivative(t);
+        let normal = surface.normal(uv.0, uv.1);
+        let denominator = tangent.dot(normal);
+        let scale = tangent.magnitude() * normal.magnitude();
+        if !denominator.is_finite()
+            || !scale.is_finite()
+            || scale <= 0.0
+            || denominator.abs() <= scale * (64.0 * f64::EPSILON)
+        {
+            return None;
+        }
+        let mut step = ((on_surface - on_curve).dot(normal) / denominator)
+            .clamp(-(end - start) * 0.25, (end - start) * 0.25);
+        let mut accepted = None;
+        for _ in 0..12 {
+            let next = (t + step).clamp(start, end);
+            if next == t {
+                break;
+            }
+            let next_point = curve.subs(next);
+            if super::finite_point(next_point)
+                && let Some(next_uv) = surface.search_nearest_parameter(next_point, Some(uv), 100)
+            {
+                let next_surface = surface.subs(next_uv.0, next_uv.1);
+                let next_distance = next_point.distance(next_surface);
+                if next_distance.is_finite() && next_distance < distance {
+                    accepted = Some((next, next_uv));
+                    break;
+                }
+            }
+            step *= 0.5;
+        }
+        let (next, next_hint) = accepted?;
+        t = next;
+        hint = Some(next_hint);
     }
+    None
 }
 
 fn create_independent_loop<P, C, D>(mut poly_curve0: C) -> Wire<P, D>
@@ -448,6 +517,7 @@ pub(super) fn create_loops_stores<C, S>(
     poly_shell0: &Shell<Point3, PolylineCurve, Option<PolygonMesh>>,
     geom_shell1: &Shell<Point3, C, S>,
     poly_shell1: &Shell<Point3, PolylineCurve, Option<PolygonMesh>>,
+    tol: f64,
 ) -> Option<LoopsStoreQuadruple<C>>
 where
     C: SearchNearestParameter<CurveParameter, Point = Point3>
@@ -465,6 +535,7 @@ where
     let mut poly_loops_store1: LoopsStore<_, _> = poly_shell1.face_iter().collect();
     let store0_len = geom_loops_store0.len();
     let store1_len = geom_loops_store1.len();
+    let mut intersection_work = 0;
     (0..store0_len)
         .flat_map(move |i| (0..store1_len).map(move |j| (i, j)))
         .try_for_each(|(face_index0, face_index1)| {
@@ -479,6 +550,8 @@ where
                 &polygon0,
                 surface1.clone(),
                 &polygon1,
+                tol,
+                &mut intersection_work,
             )?
             .into_iter()
             .try_for_each(|(polyline, mut intersection_curve)| {
@@ -503,8 +576,8 @@ where
                 } else {
                     let pv0 = Vertex::new(polyline.front());
                     let pv1 = Vertex::new(polyline.back());
-                    let gv0 = Vertex::new(polyline.front());
-                    let gv1 = Vertex::new(polyline.back());
+                    let gv0 = Vertex::new(intersection_curve.leader().front());
+                    let gv1 = Vertex::new(intersection_curve.leader().back());
                     let mut pemap0 = HashMap::default();
                     let mut pemap1 = HashMap::default();
                     let mut gemap0 = HashMap::default();
@@ -518,6 +591,7 @@ where
                             kind,
                             &surface1,
                             &mut gemap0,
+                            tol,
                         )?;
                         let polyline = intersection_curve.leader_mut();
                         *polyline.first_mut().unwrap() = gv0.point();
@@ -531,6 +605,7 @@ where
                             kind,
                             &surface1,
                             &mut gemap1,
+                            tol,
                         )?;
                         let polyline = intersection_curve.leader_mut();
                         *polyline.last_mut().unwrap() = gv1.point();
@@ -544,6 +619,7 @@ where
                             kind,
                             &surface0,
                             &mut gemap0,
+                            tol,
                         )?;
                         let polyline = intersection_curve.leader_mut();
                         *polyline.first_mut().unwrap() = gv0.point();
@@ -557,6 +633,7 @@ where
                             kind,
                             &surface0,
                             &mut gemap1,
+                            tol,
                         )?;
                         let polyline = intersection_curve.leader_mut();
                         *polyline.last_mut().unwrap() = gv1.point();
@@ -571,6 +648,15 @@ where
                 Some(())
             })
         })?;
+    if geom_loops_store0
+        .iter()
+        .chain(geom_loops_store1.iter())
+        .flat_map(|loops| loops.iter())
+        .flat_map(|wire| wire.iter())
+        .any(|edge| !edge.is_geometric_consistent())
+    {
+        return None;
+    }
     Some(LoopsStoreQuadruple {
         geom_loops_store0,
         poly_loops_store0,

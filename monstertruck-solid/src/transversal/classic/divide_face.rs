@@ -14,29 +14,72 @@ use monstertruck_topology::*;
 use rustc_hash::FxHashMap as HashMap;
 use std::ops::Deref;
 
-fn create_parameter_boundary<P, C, S>(
-    face: &Face<P, C, S>,
-    wire: &Wire<P, C>,
-    polys: &mut HashMap<EdgeId<C>, PolylineCurve<P>>,
+const MAX_PARAMETER_POINTS: usize = 1_000_000;
+
+fn project_parameter<S>(
+    surface: &S,
+    point: Point3,
+    hint: Option<Point2>,
+    tol: f64,
+) -> Option<Point2>
+where
+    S: ParametricSurface3D
+        + SearchParameter<SurfaceParameter, Point = Point3>
+        + SearchNearestParameter<SurfaceParameter, Point = Point3>,
+{
+    let seed = hint.map(Into::into);
+    let (mut u, mut v) = surface
+        .search_parameter(point, seed, 100)
+        .or_else(|| surface.search_nearest_parameter(point, seed, 100))?;
+    if let Some(hint) = hint {
+        if let Some(period) = surface
+            .period_u()
+            .filter(|period| period.is_finite() && *period > 0.0)
+        {
+            u += ((hint.x - u) / period).round() * period;
+        }
+        if let Some(period) = surface
+            .period_v()
+            .filter(|period| period.is_finite() && *period > 0.0)
+        {
+            v += ((hint.y - v) / period).round() * period;
+        }
+    }
+    if !u.is_finite() || !v.is_finite() {
+        return None;
+    }
+    let projected = surface.subs(u, v);
+    let error = projected.distance(point);
+    (error.is_finite() && error <= tol).then_some(Point2::new(u, v))
+}
+
+fn create_parameter_boundary<C, S>(
+    face: &Face<Point3, C, S>,
+    wire: &Wire<Point3, C>,
+    polys: &mut HashMap<EdgeId<C>, PolylineCurve<Point3>>,
     tol: f64,
 ) -> Option<PolylineCurve<Point2>>
 where
-    P: Copy,
-    C: BoundedCurve<Point = P> + ParameterDivision1D<Point = P>,
-    S: Clone + SearchParameter<SurfaceParameter, Point = P>,
+    C: BoundedCurve<Point = Point3> + ParameterDivision1D<Point = Point3>,
+    S: ParametricSurface3D
+        + SearchParameter<SurfaceParameter, Point = Point3>
+        + SearchNearestParameter<SurfaceParameter, Point = Point3>,
 {
     let surface = face.surface();
-    let pt = wire.front_vertex().unwrap().point();
-    let p: Point2 = surface.search_parameter(pt, None, 100)?.into();
+    let pt = wire.front_vertex()?.point();
+    let p = project_parameter(&surface, pt, None, tol)?;
     let vec = wire.edge_iter().try_fold(vec![p], |mut vec, edge| {
         let poly = polys.entry(edge.id()).or_insert_with(|| {
             let curve = edge.curve();
             let div = curve.parameter_division(curve.range_tuple(), tol).1;
             PolylineCurve(div)
         });
-        let mut p = *vec.last().unwrap();
-        let closure = |q: &P| -> Option<Point2> {
-            p = surface.search_parameter(*q, Some(p.into()), 100)?.into();
+        if poly.len() < 2 || vec.len().checked_add(poly.len())? > MAX_PARAMETER_POINTS {
+            return None;
+        }
+        let mut p = *vec.last()?;
+        let closure = |q: &Point3| -> Option<Point2> {
+            p = project_parameter(&surface, *q, Some(p), tol)?;
             Some(p)
         };
         let add: Option<Vec<Point2>> = match edge.orientation() {
@@ -47,6 +90,71 @@ where
         Some(vec)
     })?;
     Some(PolylineCurve(vec))
+}
+
+// UV coordinates have arbitrary units, independent scales and origins. A model
+// length tolerance must never be compared to their signed area. Translate and
+// normalize both axes, then retain only a numerically resolved orientation.
+fn positive_area(poly: &PolylineCurve<Point2>) -> Option<bool> {
+    let origin = *poly.first()?;
+    let scale = poly
+        .iter()
+        .fold(Vector2::new(0.0_f64, 0.0_f64), |scale, point| {
+            let delta = point - origin;
+            Vector2::new(scale.x.max(delta.x.abs()), scale.y.max(delta.y.abs()))
+        });
+    if scale.x <= 0.0 || scale.y <= 0.0 || !scale.x.is_finite() || !scale.y.is_finite() {
+        return None;
+    }
+    let (mut area, mut correction, mut absolute) = (0.0, 0.0, 0.0);
+    for (a, b) in poly
+        .iter()
+        .zip(poly.iter().cycle().skip(1))
+        .take(poly.len())
+    {
+        let a = a - origin;
+        let b = b - origin;
+        let left = (a.x / scale.x) * (b.y / scale.y);
+        let right = (a.y / scale.y) * (b.x / scale.x);
+        super::compensated_add(&mut area, &mut correction, left - right);
+        absolute += left.abs() + right.abs();
+    }
+    (area.is_finite() && area.abs() > absolute * (64.0 * f64::EPSILON)).then_some(area > 0.0)
+}
+
+fn contains(poly: &PolylineCurve<Point2>, point: Point2) -> bool {
+    let scale = poly
+        .iter()
+        .fold(Vector2::new(0.0_f64, 0.0_f64), |scale, vertex| {
+            let delta = vertex - point;
+            Vector2::new(scale.x.max(delta.x.abs()), scale.y.max(delta.y.abs()))
+        });
+    if scale.x <= 0.0 || scale.y <= 0.0 {
+        return false;
+    }
+    let mut winding = 0_i32;
+    for (a, b) in poly
+        .iter()
+        .zip(poly.iter().cycle().skip(1))
+        .take(poly.len())
+    {
+        let a = a - point;
+        let b = b - point;
+        let a = Vector2::new(a.x / scale.x, a.y / scale.y);
+        let b = Vector2::new(b.x / scale.x, b.y / scale.y);
+        let det = a.x * b.y - a.y * b.x;
+        let bound = (a.x * b.y).abs() + (a.y * b.x).abs();
+        if det.abs() <= 64.0 * f64::EPSILON * bound && a.dot(b) <= 0.0 {
+            return true;
+        }
+        if a.y <= 0.0 && b.y > 0.0 && det > 0.0 {
+            winding += 1;
+        }
+        if a.y > 0.0 && b.y <= 0.0 && det < 0.0 {
+            winding -= 1;
+        }
+    }
+    winding != 0
 }
 
 #[derive(Clone, Debug)]
@@ -63,35 +171,41 @@ fn divide_one_face<C, S>(
 ) -> Option<Vec<FaceWithShapesOpStatus<C, S>>>
 where
     C: BoundedCurve<Point = Point3> + ParameterDivision1D<Point = Point3>,
-    S: Clone + SearchParameter<SurfaceParameter, Point = Point3>,
+    S: ParametricSurface3D
+        + SearchParameter<SurfaceParameter, Point = Point3>
+        + SearchNearestParameter<SurfaceParameter, Point = Point3>,
 {
     let (mut pre_faces, mut negative_wires) = (Vec::new(), Vec::new());
     let mut map = HashMap::default();
     loops.iter().try_for_each(|wire| {
         let poly = create_parameter_boundary(face, wire, &mut map, tol)?;
-        let area = poly.area();
-        if area.abs() < tol {
-            return Some(());
-        }
-        match area > 0.0 {
+        match positive_area(&poly)? {
             true => pre_faces.push(vec![WireChunk { poly, wire }]),
             false => negative_wires.push(WireChunk { poly, wire }),
         }
         Some(())
     })?;
     negative_wires.into_iter().try_for_each(|chunk| {
-        let pt = chunk.poly.front();
-        let idx = pre_faces.iter().position(|face| face[0].poly.include(pt));
-        if let Some(i) = idx {
-            let outer_area = pre_faces[i][0].poly.area();
-            let chunk_area = chunk.poly.area();
-            // If the sum of areas is zero, the face is canceled.
-            // This happens when an intersection loop exactly matches the face boundary.
-            if (outer_area + chunk_area).abs() < tol {
-                pre_faces[i].clear();
-            } else {
-                pre_faces[i].push(chunk);
+        let point = *chunk.poly.first()?;
+        let mut owner: Option<usize> = None;
+        for (index, pre_face) in pre_faces.iter().enumerate() {
+            let Some(outer) = pre_face.first() else {
+                continue;
+            };
+            if contains(&outer.poly, point)
+                && owner.is_none_or(|old| contains(&pre_faces[old][0].poly, outer.poly.front()))
+            {
+                owner = Some(index);
             }
+        }
+        // An orphan hole is a failed split, not an ignorable loop.
+        let owner = owner?;
+        let outer = &pre_faces[owner][0];
+        if outer.wire.deref().inverse() == *chunk.wire.deref() {
+            // Cancellation requires the same boundary, not merely equal areas.
+            pre_faces[owner].clear();
+        } else {
+            pre_faces[owner].push(chunk);
         }
         Some(())
     })?;
@@ -111,7 +225,7 @@ where
                 .into_iter()
                 .map(|chunk| chunk.wire.deref().clone())
                 .collect();
-            let mut new_face = Face::debug_new(wires, surface).ok()?;
+            let mut new_face = Face::try_new(wires, surface).ok()?;
             if !face.orientation() {
                 new_face.invert();
             }
@@ -128,8 +242,13 @@ pub(super) fn divide_faces<C, S>(
 ) -> Option<FacesClassification<Point3, C, S>>
 where
     C: BoundedCurve<Point = Point3> + ParameterDivision1D<Point = Point3>,
-    S: Clone + SearchParameter<SurfaceParameter, Point = Point3>,
+    S: ParametricSurface3D
+        + SearchParameter<SurfaceParameter, Point = Point3>
+        + SearchNearestParameter<SurfaceParameter, Point = Point3>,
 {
+    if shell.len() != loops_store.len() {
+        return None;
+    }
     let mut res = FacesClassification::<Point3, C, S>::default();
     shell
         .iter()

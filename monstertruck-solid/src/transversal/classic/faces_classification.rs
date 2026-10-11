@@ -8,7 +8,7 @@
 
 use super::loops_store::ShapesOpStatus;
 use monstertruck_topology::*;
-use rustc_hash::FxHashMap as HashMap;
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 #[derive(Clone, Debug)]
 pub(super) struct FacesClassification<P, C, S> {
@@ -44,32 +44,47 @@ impl<P, C, S> FacesClassification<P, C, S> {
         [and, or, unknown]
     }
 
-    pub(super) fn integrate_by_component(&mut self) {
+    pub(super) fn integrate_by_component(&mut self) -> Option<()> {
         let [and, or, unknown] = self.and_or_unknown();
-        let and_boundary = and.extract_boundaries();
-        let or_boundary = or.extract_boundaries();
-        let components = unknown.connected_components();
-        for comp in components {
+        let and_boundary: HashSet<_> = and
+            .extract_boundaries()
+            .into_iter()
+            .flatten()
+            .map(|edge| edge.id())
+            .collect();
+        let or_boundary: HashSet<_> = or
+            .extract_boundaries()
+            .into_iter()
+            .flatten()
+            .map(|edge| edge.id())
+            .collect();
+        for comp in unknown.connected_components() {
             let boundary = comp.extract_boundaries();
-            if and_boundary
-                .iter()
-                .flatten()
-                .any(|edge| edge.id() == boundary[0][0].id())
-            {
-                comp.iter().for_each(|face| {
-                    // SAFETY: face originated from `self.shell` via `and_or_unknown()`.
-                    *self.status.get_mut(&face.id()).unwrap() = ShapesOpStatus::And;
-                })
-            } else if or_boundary
-                .iter()
-                .flatten()
-                .any(|edge| edge.id() == boundary[0][0].id())
-            {
-                comp.iter().for_each(|face| {
-                    // SAFETY: face originated from `self.shell` via `and_or_unknown()`.
-                    *self.status.get_mut(&face.id()).unwrap() = ShapesOpStatus::Or;
-                })
+            // Closed untouched components have no boundary to inherit from.
+            // Open components must agree at every classified neighboring edge;
+            // taking the first edge made classification depend on iteration order.
+            let mut inherited = None;
+            for edge in boundary.iter().flatten() {
+                let status = match (
+                    and_boundary.contains(&edge.id()),
+                    or_boundary.contains(&edge.id()),
+                ) {
+                    (true, false) => ShapesOpStatus::And,
+                    (false, true) => ShapesOpStatus::Or,
+                    (false, false) => continue,
+                    (true, true) => return None,
+                };
+                if inherited.is_some_and(|previous| previous != status) {
+                    return None;
+                }
+                inherited = Some(status);
+            }
+            if let Some(status) = inherited {
+                for face in &comp {
+                    *self.status.get_mut(&face.id())? = status;
+                }
             }
         }
+        Some(())
     }
 }
