@@ -23,11 +23,88 @@ pub enum BoundaryCurve2D {
     NurbsCurve(NurbsCurve<Vector3>),
 }
 
-impl<S> ParameterBoundary2D<S> for Line<Point3> {}
+impl<S> ParameterBoundary2D<S> for Line<Point3> {
+    fn exact_straight_segment(&self) -> Option<(Point3, Point3)> { Some((self.0, self.1)) }
+    fn from_straight_segment(front: Point3, back: Point3) -> Option<Self> {
+        Some(Line(front, back))
+    }
+}
 
-impl<S> ParameterBoundary2D<S> for BsplineCurve<Point3> {}
+impl<S> ParameterBoundary2D<S> for BsplineCurve<Point3> {
+    fn exact_straight_segment(&self) -> Option<(Point3, Point3)> {
+        (self.degree() == 1 && self.control_points().len() <= 256).then_some(())?;
+        let mut curve = self.clone();
+        curve.clamp();
+        continuous_linear_knots(curve.knot_vector(), curve.range_tuple())?;
+        straight_controls(curve.control_points().iter().copied())
+    }
+    fn from_straight_segment(front: Point3, back: Point3) -> Option<Self> {
+        Some(Line(front, back).into())
+    }
+}
 
-impl<S> ParameterBoundary2D<S> for NurbsCurve<Vector4> {}
+impl<S> ParameterBoundary2D<S> for NurbsCurve<Vector4> {
+    fn exact_straight_segment(&self) -> Option<(Point3, Point3)> {
+        let curve = self.non_rationalized();
+        (curve.degree() == 1 && curve.control_points().len() <= 256).then_some(())?;
+        let mut curve = curve.clone();
+        curve.clamp();
+        continuous_linear_knots(curve.knot_vector(), curve.range_tuple())?;
+        let controls = curve
+            .control_points()
+            .iter()
+            .map(|p| (p.w.is_finite() && p.w > 0.0).then(|| Point3::from_vec(p.truncate() / p.w)))
+            .collect::<Option<Vec<_>>>()?;
+        straight_controls(controls)
+    }
+    fn from_straight_segment(front: Point3, back: Point3) -> Option<Self> {
+        Some(NurbsCurve::new(BsplineCurve::new(
+            KnotVector::bezier_knot(1),
+            vec![front.to_homogeneous(), back.to_homogeneous()],
+        )))
+    }
+}
+
+// For degree one and positive weights, strictly ordered collinear controls
+// prove complete monotone traversal on every rational span.
+fn continuous_linear_knots(knots: &KnotVector, (a, b): (f64, f64)) -> Option<()> {
+    if !a.is_finite()
+        || !b.is_finite()
+        || a >= b
+        || knots.iter().any(|t| !t.is_finite())
+        || knots
+            .windows(2)
+            .any(|pair| pair[0] == pair[1] && pair[0] > a && pair[0] < b)
+    {
+        None
+    } else {
+        Some(())
+    }
+}
+fn straight_controls(points: impl IntoIterator<Item = Point3>) -> Option<(Point3, Point3)> {
+    let points = points.into_iter().collect::<Vec<_>>();
+    let (front, back) = (*points.first()?, *points.last()?);
+    let delta = back - front;
+    let length = delta.magnitude();
+    if !length.is_finite() || length <= TOLERANCE {
+        return None;
+    }
+    let direction = delta / length;
+    let mut previous = None;
+    for point in points {
+        let local = point - front;
+        let position = local.dot(direction);
+        if !position.is_finite()
+            || !local.magnitude().is_finite()
+            || local.cross(direction).magnitude() > TOLERANCE
+            || previous.is_some_and(|old| position <= old)
+        {
+            return None;
+        }
+        previous = Some(position);
+    }
+    Some((front, back))
+}
 
 impl<C, S> ExactParameterBoundary2D<S> for ParameterCurve<C, S>
 where

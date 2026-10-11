@@ -168,6 +168,12 @@ pub enum ShapeOpsError {
         "failed to construct surface intersection loops; contact or coincident boundaries may require a dedicated operation."
     )]
     IntersectionLoopsFailed,
+    /// A native planar arrangement could not certify its geometry or topology.
+    #[error("native planar Boolean arrangement failed during {stage}.")]
+    PlanarArrangementFailed {
+        /// Geometry, classification, or topology stage that could not be resolved.
+        stage: &'static str,
+    },
     /// An unknown face has no safely classifiable interior sample.
     #[error(
         "could not classify face {face_index} of operand {shell_index} away from the other boundary at the requested tolerance."

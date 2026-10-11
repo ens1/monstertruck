@@ -226,6 +226,21 @@ pub trait ParameterBoundary2D<S> {
     ///
     /// Returns `None` when `self` does not carry an exact boundary on `surface`.
     fn parameter_boundary_2d(&self, _surface: &S, _tolerance: f64) -> Option<Vec<Point2>> { None }
+
+    /// Exact straight-segment capability for native planar arrangements.
+    ///
+    /// Implementations must prove that the complete bounded curve traverses
+    /// this segment once, without reversal. Sampling a curve is not sufficient.
+    /// The endpoints follow the curve's parameter direction. The default keeps
+    /// custom and implicit curve representations on their existing code path.
+    fn exact_straight_segment(&self) -> Option<(Point3, Point3)> { None }
+
+    /// Constructs an exact straight segment, when this representation supports it.
+    /// No sampled or fitted substitute may be returned by this capability.
+    fn from_straight_segment(_front: Point3, _back: Point3) -> Option<Self>
+    where Self: Sized {
+        None
+    }
 }
 
 /// Exact face-local trim of a 3D curve on a given surface.

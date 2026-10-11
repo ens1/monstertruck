@@ -469,6 +469,25 @@ impl TryFrom<ParameterCurve<Line<Point2>, Surface>> for Curve {
 }
 
 impl ParameterBoundary2D<Surface> for Curve {
+    fn exact_straight_segment(&self) -> Option<(Point3, Point3)> {
+        match self {
+            Self::Line(curve) => {
+                <Line<Point3> as ParameterBoundary2D<Surface>>::exact_straight_segment(curve)
+            }
+            Self::BsplineCurve(curve) => {
+                <BsplineCurve<Point3> as ParameterBoundary2D<Surface>>::exact_straight_segment(
+                    curve,
+                )
+            }
+            Self::NurbsCurve(curve) => {
+                <NurbsCurve<Vector4> as ParameterBoundary2D<Surface>>::exact_straight_segment(curve)
+            }
+            _ => None,
+        }
+    }
+    fn from_straight_segment(front: Point3, back: Point3) -> Option<Self> {
+        Some(Self::Line(Line(front, back)))
+    }
     fn parameter_boundary_2d(&self, surface: &Surface, tolerance: f64) -> Option<Vec<Point2>> {
         match self {
             Curve::Line(curve) => exact_line_boundary(curve, surface)

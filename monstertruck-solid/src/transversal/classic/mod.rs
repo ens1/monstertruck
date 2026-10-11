@@ -23,6 +23,7 @@ mod divide_face;
 mod faces_classification;
 mod intersection_curve;
 mod loops_store;
+mod planar;
 
 use super::integrate::{ShapeOpsCurve, ShapeOpsError, ShapeOpsSurface, ShellOrientationHints};
 use crate::alternative::Alternative;
@@ -343,6 +344,9 @@ fn process_one_pair_of_shells<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
     tol: f64,
     orientation_hints: Option<ShellOrientationHints>,
 ) -> ClassicResult<[Shell<Point3, C, S>; 2]> {
+    if let Some(result) = planar::partition(shell0, shell1, orientation_hints)? {
+        return Ok(result);
+    }
     let pairs = shell0.len().checked_mul(shell1.len());
     if pairs.is_none_or(|pairs| pairs > MAX_FACE_PAIRS) {
         return Err(ShapeOpsError::ResourceLimit {
@@ -544,6 +548,11 @@ pub(crate) fn or<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
     let shell0: Shell<_, _, _> = solid0.face_iter().cloned().collect();
     let shell1: Shell<_, _, _> = solid1.face_iter().cloned().collect();
     let [_, or_shell] = process_one_pair_of_shells(&shell0, &shell1, tol, None)?;
+    // The union of two nonempty material domains cannot be empty. With
+    // complemented operands, cancellation of every boundary is universal.
+    if or_shell.is_empty() {
+        return Err(ShapeOpsError::UnboundedResult { operation });
+    }
     finalize(operation, or_shell)
 }
 
