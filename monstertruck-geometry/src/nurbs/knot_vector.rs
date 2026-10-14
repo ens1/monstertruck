@@ -1,3 +1,4 @@
+use super::bspline_curve::knot_insertion_ratio;
 use super::*;
 use crate::errors::Error;
 use smallvec::SmallVec;
@@ -79,7 +80,7 @@ impl KnotVector {
     }
 
     #[inline(always)]
-    fn strict_multiplicity(&self, i: usize) -> usize {
+    pub(super) fn strict_multiplicity(&self, i: usize) -> usize {
         let knot = self[i];
         self.iter().filter(|value| **value == knot).count()
     }
@@ -270,11 +271,9 @@ impl KnotVector {
 
         for k in 1..=(degree - der_rank) {
             let base = idx.saturating_sub(k);
-            let delta = self[base + k] - self[base];
-            let mut a = inv_or_zero_strict(delta) * (t - self[base]);
+            let mut a = knot_insertion_ratio(t, self[base], self[base + k]);
             for i in base..=usize::min(idx, n - k - 1) {
-                let delta = self[i + k + 1] - self[i + 1];
-                let b = inv_or_zero_strict(delta) * (self[i + k + 1] - t);
+                let b = knot_insertion_ratio(t, self[i + k + 1], self[i + 1]);
                 let j = i - start;
                 eval[j] = a * eval[j] + b * eval[j + 1];
                 a = 1.0 - b;
@@ -433,7 +432,7 @@ impl KnotVector {
     /// ```
     #[inline(always)]
     pub fn is_clamped(&self, degree: usize) -> bool {
-        self.multiplicity(0) > degree && self.multiplicity(self.len() - 1) > degree
+        self.strict_multiplicity(0) > degree && self.strict_multiplicity(self.len() - 1) > degree
     }
 
     /// Concats two knot vectors.

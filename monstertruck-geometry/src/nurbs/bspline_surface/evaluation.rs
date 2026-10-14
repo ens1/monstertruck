@@ -1,3 +1,4 @@
+use super::super::bspline_curve::derivation_control;
 use super::*;
 
 impl<P: ControlPoint<f64>> BsplineSurface<P> {
@@ -40,9 +41,10 @@ impl<P: ControlPoint<f64>> BsplineSurface<P> {
             (0..=n0)
                 .map(|i| {
                     let delta = knot_vector_u[i + k] - knot_vector_u[i];
-                    let coef = (k as f64) * inv_or_zero(delta);
                     (0..n1)
-                        .map(|j| self.udelta_control_points(i, j) * coef)
+                        .map(|j| {
+                            derivation_control::<P>(self.udelta_control_points(i, j), k, delta)
+                        })
                         .collect()
                 })
                 .collect()
@@ -89,9 +91,12 @@ impl<P: ControlPoint<f64>> BsplineSurface<P> {
             let mut new_points = vec![Vec::with_capacity(n1 + 1); n0];
             for j in 0..=n1 {
                 let delta = knot_vector_v[j + k] - knot_vector_v[j];
-                let coef = (k as f64) * inv_or_zero(delta);
                 for (i, vec) in new_points.iter_mut().enumerate() {
-                    vec.push(self.vdelta_control_points(i, j) * coef)
+                    vec.push(derivation_control::<P>(
+                        self.vdelta_control_points(i, j),
+                        k,
+                        delta,
+                    ))
                 }
             }
             new_points

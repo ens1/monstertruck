@@ -1,3 +1,4 @@
+use super::super::bspline_curve::cut_degree;
 use super::*;
 
 impl<P: ControlPoint<f64> + Tolerance> BsplineSurface<P> {
@@ -41,63 +42,75 @@ impl<P: ControlPoint<f64> + Tolerance> BsplineSurface<P> {
     ///     }
     /// }
     /// ```
-    pub fn cut_u(&mut self, mut u: f64) -> BsplineSurface<P> {
-        let degree = self.udegree();
-        let u_start = self.knot_vector_u()[0];
-        let u_end = self.knot_vector_u()[self.knot_vector_u().len() - 1];
-
-        if u == u_start {
-            let right = self.clone();
-            let knot_vector_v = self.knot_vector_v().clone();
-            let control_points = vec![self.control_points[0].clone()];
-            *self = BsplineSurface::new_unchecked(
-                (KnotVector::from(vec![u_start, u_start]), knot_vector_v),
-                control_points,
-            );
-            return right;
-        } else if u == u_end {
-            let knot_vector_v = self.knot_vector_v().clone();
-            let row = self.control_points[self.control_points.len() - 1].clone();
-            return BsplineSurface::new_unchecked(
-                (KnotVector::from(vec![u_end, u_end]), knot_vector_v),
-                vec![row],
-            );
-        }
-
-        let idx = match self.knot_vector_u().floor(u) {
-            Some(idx) => idx,
-            None => {
-                let bspline = self.clone();
-                let knot_vector_u = KnotVector::from(vec![u, self.knot_vector_u()[0]]);
-                let knot_vector_v = self.knot_vector_v().clone();
-                let control_points = vec![vec![P::origin(); knot_vector_v.len()]];
-                *self = BsplineSurface::new((knot_vector_u, knot_vector_v), control_points);
-                return bspline;
-            }
-        };
-        let s = if u.near(&self.knot_vector_u()[idx]) {
-            u = self.knot_vector_u()[idx];
-            self.knot_vector_u().multiplicity(idx)
-        } else {
-            0
-        };
-
-        for _ in s..=degree {
-            self.add_knot_u(u);
-        }
-
-        let knot_vector_v = self.knot_vector_v().clone();
-        // SAFETY: `u` was just added with full multiplicity, so it exists in the knot vector.
-        let k = self.knot_vector_u().floor(u).unwrap();
-        let m = self.knot_vector_u().len();
-        let n = self.control_points.len();
-        let knot_vec0 = self.knot_vector_u().sub_vec(0..=k);
-        let knot_vec1 = self.knot_vector_u().sub_vec((k - degree)..m);
-        let control_points0 = Vec::from(&self.control_points[0..(k - degree)]);
-        let control_points1 = Vec::from(&self.control_points[(k - degree)..n]);
-        *self = BsplineSurface::new_unchecked((knot_vec0, knot_vector_v.clone()), control_points0);
-        BsplineSurface::new_unchecked((knot_vec1, knot_vector_v), control_points1)
+    ///
+    /// # Panics
+    ///
+    /// Panics on an unsupported split; see [`Self::try_cut_u`] for transactional failure.
+    pub fn cut_u(&mut self, u: f64) -> BsplineSurface<P> {
+        self.try_cut_u(u).unwrap_or_else(|error| panic!("{error}"))
     }
+
+    /// Splits the surface at the exact finite `u`, without nearby-knot snapping.
+    ///
+    /// All homogeneous control columns use [`BsplineCurve::try_cut`], including
+    /// evaluating the true boundary of an unclamped source. The returned surface
+    /// covers the right part; `self` changes only after every column succeeds.
+    /// Exact active-domain ends produce degree-zero boundary sentinels.
+    ///
+    /// # Failures
+    ///
+    /// Rejects malformed grids, invalid knots, cuts outside the active domain,
+    /// degenerate splits and nonfinite coefficient arithmetic. Failure leaves
+    /// `self` unchanged. Native rounded coefficients have no certified world-space
+    /// residual bound; geometry admission must validate that bound separately.
+    pub fn try_cut_u(&mut self, u: f64) -> std::result::Result<Self, BsplineCutError> {
+        let columns = self.cut_grid_shape()?;
+        let splits = (0..columns)
+            .map(|column| {
+                let controls = self.control_points.iter().map(|row| row[column]).collect();
+                let mut left = BsplineCurve::new_unchecked(self.knot_vecs.0.clone(), controls);
+                let right = left.try_cut(u)?;
+                Ok((left, right))
+            })
+            .collect::<std::result::Result<Vec<_>, BsplineCutError>>()?;
+        let left_knots = splits[0].0.knot_vector().clone();
+        let right_knots = splits[0].1.knot_vector().clone();
+        let left_controls = (0..splits[0].0.control_points().len())
+            .map(|row| {
+                splits
+                    .iter()
+                    .map(|pair| pair.0.control_points()[row])
+                    .collect()
+            })
+            .collect();
+        let right_controls = (0..splits[0].1.control_points().len())
+            .map(|row| {
+                splits
+                    .iter()
+                    .map(|pair| pair.1.control_points()[row])
+                    .collect()
+            })
+            .collect();
+        let right = Self::new_unchecked((right_knots, self.knot_vecs.1.clone()), right_controls);
+        *self = Self::new_unchecked((left_knots, self.knot_vecs.1.clone()), left_controls);
+        Ok(right)
+    }
+
+    fn cut_grid_shape(&self) -> std::result::Result<usize, BsplineCutError> {
+        let columns = self
+            .control_points
+            .first()
+            .filter(|row| !row.is_empty())
+            .map(Vec::len)
+            .ok_or(BsplineCutError::InvalidSpline)?;
+        if self.control_points.iter().any(|row| row.len() != columns) {
+            return Err(BsplineCutError::InvalidSpline);
+        }
+        cut_degree(&self.knot_vecs.0, self.control_points.len())?;
+        cut_degree(&self.knot_vecs.1, columns)?;
+        Ok(columns)
+    }
+
     /// Cuts the curve to two curves at the parameter `t`
     /// # Examples
     /// ```
@@ -138,12 +151,37 @@ impl<P: ControlPoint<f64> + Tolerance> BsplineSurface<P> {
     ///     }
     /// }
     /// ```
+    ///
+    /// # Panics
+    ///
+    /// Panics on an unsupported split; see [`Self::try_cut_v`] for transactional failure.
     pub fn cut_v(&mut self, v: f64) -> BsplineSurface<P> {
-        self.swap_axes();
-        let mut res = self.cut_u(v);
-        self.swap_axes();
-        res.swap_axes();
-        res
+        self.try_cut_v(v).unwrap_or_else(|error| panic!("{error}"))
+    }
+
+    /// Splits the surface at the exact finite `v`, with the failure contract of
+    /// [`Self::try_cut_u`]. Each homogeneous control row uses the same native
+    /// exact-parameter curve splitter; failure leaves both axes and the grid unchanged.
+    pub fn try_cut_v(&mut self, v: f64) -> std::result::Result<Self, BsplineCutError> {
+        self.cut_grid_shape()?;
+        let splits = self
+            .control_points
+            .iter()
+            .map(|row| {
+                let mut left = BsplineCurve::new_unchecked(self.knot_vecs.1.clone(), row.clone());
+                let right = left.try_cut(v)?;
+                Ok((left, right))
+            })
+            .collect::<std::result::Result<Vec<_>, BsplineCutError>>()?;
+        let left_knots = splits[0].0.knot_vector().clone();
+        let right_knots = splits[0].1.knot_vector().clone();
+        let (left_controls, right_controls): (Vec<_>, Vec<_>) = splits
+            .into_iter()
+            .map(|pair| (pair.0.control_points, pair.1.control_points))
+            .unzip();
+        let right = Self::new_unchecked((self.knot_vecs.0.clone(), right_knots), right_controls);
+        *self = Self::new_unchecked((self.knot_vecs.0.clone(), left_knots), left_controls);
+        Ok(right)
     }
 
     /// Creates a sectional curve with normalized knot vector from the parameter `p` to the parameter `q`.
@@ -182,16 +220,16 @@ impl<P: ControlPoint<f64> + Tolerance> BsplineSurface<P> {
         let p = bnd_box.min();
         let q = bnd_box.max();
         let mut bspsurface = self.clone();
-        if !p[0].near(&bspsurface.knot_u(0)) {
+        if p[0] != bspsurface.knot_u(bspsurface.udegree()) {
             bspsurface = bspsurface.cut_u(p[0]);
         }
-        if !q[0].near(&bspsurface.knot_u(bspsurface.knot_vector_u().len() - 1)) {
+        if q[0] != bspsurface.knot_u(bspsurface.control_points.len()) {
             bspsurface.cut_u(q[0]);
         }
-        if !p[0].near(&bspsurface.knot_v(0)) {
+        if p[1] != bspsurface.knot_v(bspsurface.vdegree()) {
             bspsurface = bspsurface.cut_v(p[1]);
         }
-        if !q[0].near(&bspsurface.knot_v(bspsurface.knot_vector_v().len() - 1)) {
+        if q[1] != bspsurface.knot_v(bspsurface.control_points[0].len()) {
             bspsurface.cut_v(q[1]);
         }
         bspsurface.syncro_uvdegrees();

@@ -1,3 +1,4 @@
+use super::super::bspline_curve::{insertion_control, knot_insertion_ratio};
 use super::*;
 use crate::errors::Error;
 
@@ -40,11 +41,16 @@ impl<P: ControlPoint<f64> + Tolerance> BsplineSurface<P> {
         };
         for i in start..end {
             let i0 = end + start - i - 1;
-            let delta = self.knot_u(i0 + k + 1) - self.knot_u(i0);
-            let a = inv_or_zero(delta) * (self.knot_u(idx) - self.knot_u(i0));
+            let a =
+                knot_insertion_ratio(self.knot_u(idx), self.knot_u(i0), self.knot_u(i0 + k + 1));
             for j in 0..n1 {
-                let p = self.udelta_control_points(i0, j) * (1.0 - a);
-                self.control_points[i0][j] -= p;
+                let previous = if i0 == 0 {
+                    P::origin()
+                } else {
+                    self.control_points[i0 - 1][j]
+                };
+                self.control_points[i0][j] =
+                    insertion_control(self.control_points[i0][j], previous, a);
             }
         }
         self
@@ -96,11 +102,19 @@ impl<P: ControlPoint<f64> + Tolerance> BsplineSurface<P> {
         };
         for j in start..end {
             let j0 = end + start - j - 1;
-            let delta = self.knot_vecs.1[j0 + k + 1] - self.knot_vecs.1[j0];
-            let a = inv_or_zero(delta) * (self.knot_vecs.1[idx] - self.knot_vecs.1[j0]);
+            let a = knot_insertion_ratio(
+                self.knot_vecs.1[idx],
+                self.knot_vecs.1[j0],
+                self.knot_vecs.1[j0 + k + 1],
+            );
             for i in 0..n0 {
-                let p = self.vdelta_control_points(i, j0) * (1.0 - a);
-                self.control_points[i][j0] -= p;
+                let previous = if j0 == 0 {
+                    P::origin()
+                } else {
+                    self.control_points[i][j0 - 1]
+                };
+                self.control_points[i][j0] =
+                    insertion_control(self.control_points[i][j0], previous, a);
             }
         }
         self

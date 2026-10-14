@@ -254,6 +254,8 @@ pub mod fair;
 pub mod offset;
 
 mod bspline_curve;
+/// Errors from exact-parameter native curve and surface splitting.
+pub use bspline_curve::BsplineCutError;
 mod bspline_surface;
 /// Full-boundary continuity capability inspection.
 mod continuity;

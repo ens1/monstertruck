@@ -2,6 +2,120 @@ use super::*;
 use crate::errors::Error;
 use std::ops::*;
 
+/// A native B-spline split could not preserve its requested parameter and valid domains.
+#[derive(Clone, Copy, Debug, PartialEq, thiserror::Error)]
+pub enum BsplineCutError {
+    /// The requested parameter is not finite.
+    #[error("The B-spline cut parameter must be finite.")]
+    NonFiniteParameter,
+    /// The source knots, control coefficients, or degree are malformed.
+    #[error("The B-spline cut source has invalid knots, controls, or degree.")]
+    InvalidSpline,
+    /// The cut is outside the active evaluation domain.
+    #[error("The B-spline cut parameter {parameter} is outside [{start}, {end}].")]
+    OutsideDomain {
+        /// The requested cut parameter.
+        parameter: f64,
+        /// The first active parameter.
+        start: f64,
+        /// The last active parameter.
+        end: f64,
+    },
+    /// A split would create an invalid or unsupported collapsed domain.
+    #[error("The B-spline split has a degenerate active domain or knot block.")]
+    DegenerateSplit,
+    /// Native coefficient arithmetic cannot represent the split with finite values.
+    #[error("The B-spline cut coefficient arithmetic is not finite.")]
+    NonFiniteArithmetic,
+}
+
+pub(super) fn cut_degree(
+    knots: &KnotVector,
+    controls: usize,
+) -> std::result::Result<usize, BsplineCutError> {
+    let degree = knots
+        .len()
+        .checked_sub(controls.saturating_add(1))
+        .filter(|degree| controls > *degree)
+        .ok_or(BsplineCutError::InvalidSpline)?;
+    if knots.iter().any(|knot| !knot.is_finite()) || knots.windows(2).any(|pair| pair[0] > pair[1])
+    {
+        return Err(BsplineCutError::InvalidSpline);
+    }
+    let (start, end) = (knots[degree], knots[controls]);
+    if start > end || (start == end && (degree != 0 || controls != 1)) {
+        return Err(BsplineCutError::DegenerateSplit);
+    }
+    if start != end {
+        let mut repeated = 1;
+        for pair in knots.windows(2) {
+            repeated = if pair[0] == pair[1] { repeated + 1 } else { 1 };
+            // Native derivative nets and endpoint insertion retain harmless
+            // zero-support controls at active domain ends. Interior overfull
+            // blocks cannot receive the same exemption.
+            if repeated > degree + 1 && pair[1] != start && pair[1] != end {
+                return Err(BsplineCutError::DegenerateSplit);
+            }
+        }
+    }
+    Ok(degree)
+}
+
+pub(super) fn finite_control<P: ControlPoint<f64>>(point: &P) -> bool {
+    (0..P::DIM).all(|component| point[component].is_finite())
+}
+
+pub(super) fn knot_insertion_ratio(x: f64, start: f64, end: f64) -> f64 {
+    if start == end || x == start {
+        0.0
+    } else if x == end {
+        1.0
+    } else {
+        // Divide the two intervals directly: a reciprocal can overflow even when
+        // the dimensionless ratio of a very small positive span is representable.
+        let (numerator, denominator) = (x - start, end - start);
+        if numerator.is_finite() && denominator.is_finite() {
+            numerator / denominator
+        } else {
+            // Scaling both intervals handles finite knots whose subtraction overflows.
+            let scale = x.abs().max(start.abs()).max(end.abs());
+            (x / scale - start / scale) / (end / scale - start / scale)
+        }
+    }
+}
+
+pub(super) fn insertion_control<P: ControlPoint<f64>>(current: P, previous: P, a: f64) -> P {
+    if a == 0.0 {
+        previous
+    } else if a == 1.0 {
+        current
+    } else {
+        // Interpolate homogeneous coefficients as well as Euclidean control points.
+        // Avoid forming a potentially overflowing difference between finite controls.
+        let mut point = P::origin();
+        for component in 0..P::DIM {
+            point[component] = a.mul_add(current[component], (1.0 - a) * previous[component]);
+        }
+        point
+    }
+}
+
+pub(super) fn derivation_control<P: ControlPoint<f64>>(
+    difference: P::Diff,
+    degree: usize,
+    delta: f64,
+) -> P::Diff {
+    let mut derivative = P::Diff::zero();
+    if delta != 0.0 {
+        // Divide coefficients directly so a small valid span does not lose its
+        // derivative to a geometric tolerance or an overflowing reciprocal.
+        for component in 0..P::DIM {
+            derivative[component] = (difference[component] / delta) * degree as f64;
+        }
+    }
+    derivative
+}
+
 impl<P> BsplineCurve<P> {
     /// constructor.
     /// # Arguments
@@ -200,8 +314,11 @@ impl<P: ControlPoint<f64>> BsplineCurve<P> {
             let (knot_vec, new_points) = (&knot_vec, &mut new_points);
             (0..=n).for_each(move |i| {
                 let delta = knot_vec[i + k] - knot_vec[i];
-                let coef = (k as f64) * inv_or_zero(delta);
-                new_points.push(self.delta_control_points(i) * coef);
+                new_points.push(derivation_control::<P>(
+                    self.delta_control_points(i),
+                    k,
+                    delta,
+                ));
             });
         } else {
             new_points = vec![P::Diff::zero(); n];
@@ -691,10 +808,17 @@ impl<P: ControlPoint<f64> + Tolerance> BsplineCurve<P> {
         };
         for i in start..end {
             let i0 = end + start - i - 1;
-            let delta = self.knot_vec[i0 + k + 1] - self.knot_vec[i0];
-            let a = (self.knot_vec[idx] - self.knot_vec[i0]) * inv_or_zero(delta);
-            let p = self.delta_control_points(i0) * (1.0 - a);
-            self.control_points[i0] -= p;
+            let a = knot_insertion_ratio(
+                self.knot_vec[idx],
+                self.knot_vec[i0],
+                self.knot_vec[i0 + k + 1],
+            );
+            let previous = if i0 == 0 {
+                P::origin()
+            } else {
+                self.control_points[i0 - 1]
+            };
+            self.control_points[i0] = insertion_control(self.control_points[i0], previous, a);
         }
         self
     }
@@ -828,13 +952,13 @@ impl<P: ControlPoint<f64> + Tolerance> BsplineCurve<P> {
     pub fn clamp(&mut self) -> &mut Self {
         let degree = self.degree();
 
-        let s = self.knot_vec.multiplicity(0);
+        let s = self.knot_vec.strict_multiplicity(0);
         for _ in s..=degree {
             self.add_knot(self.knot_vec[0]);
         }
 
         let n = self.knot_vec.len();
-        let s = self.knot_vec.multiplicity(n - 1);
+        let s = self.knot_vec.strict_multiplicity(n - 1);
         for _ in s..=degree {
             self.add_knot(self.knot_vec[n - 1]);
         }
@@ -1127,63 +1251,116 @@ impl<P: ControlPoint<f64>> ParameterTransform for BsplineCurve<P> {
     }
 }
 
-impl<P: ControlPoint<f64> + Tolerance> Cut for BsplineCurve<P> {
-    fn cut(&mut self, mut t: f64) -> BsplineCurve<P> {
-        let degree = self.degree();
-        let knot_start = self.knot_vec[0];
-        let knot_end = self.knot_vec[self.knot_vec.len() - 1];
-
-        // Snap cuts within `TOLERANCE` of the domain ends onto the ends themselves.
-        // Otherwise the near-knot snapping below lands on the full-multiplicity end
-        // knot blocks and produces invalid empty halves.
-        if t.near(&knot_start) {
-            let point = self.subs(knot_start);
-            let right = self.clone();
-            *self = BsplineCurve::new_unchecked(
-                KnotVector::from(vec![knot_start, knot_start]),
-                vec![point],
-            );
-            return right;
-        } else if t.near(&knot_end) {
-            let point = self.subs(knot_end);
-            return BsplineCurve::new_unchecked(
-                KnotVector::from(vec![knot_end, knot_end]),
-                vec![point],
-            );
+impl<P: ControlPoint<f64> + Tolerance> BsplineCurve<P> {
+    /// Splits this curve at the exact finite `t`, without tolerance-based knot snapping.
+    ///
+    /// The returned curve covers the right part; `self` receives the left part only
+    /// after a successful split. Both active domains meet at the requested stored
+    /// `f64` parameter. An exact domain-end cut returns a degree-zero boundary
+    /// sentinel on the empty side, preserving the other side's original curve.
+    ///
+    /// # Failures
+    ///
+    /// Rejects invalid/nonfinite sources, a parameter outside the active domain,
+    /// malformed repeated-knot blocks, and nonfinite coefficient arithmetic.
+    /// Failure leaves `self` unchanged. Native floating-point insertion still rounds
+    /// coefficients; this API does not certify a world-space geometric error budget.
+    pub fn try_cut(&mut self, t: f64) -> std::result::Result<Self, BsplineCutError> {
+        if !t.is_finite() {
+            return Err(BsplineCutError::NonFiniteParameter);
         }
-
-        let idx = match self.knot_vec.floor(t) {
-            Some(idx) => idx,
-            None => {
-                let bspline = self.clone();
-                let knot_vec = KnotVector::from(vec![t, self.knot_vec[0]]);
-                let control_points = vec![P::origin()];
-                *self = BsplineCurve::new(knot_vec, control_points);
-                return bspline;
+        let degree = cut_degree(&self.knot_vec, self.control_points.len())?;
+        if self
+            .control_points
+            .iter()
+            .any(|point| !finite_control(point))
+        {
+            return Err(BsplineCutError::InvalidSpline);
+        }
+        let (start, end) = (
+            self.knot_vec[degree],
+            self.knot_vec[self.control_points.len()],
+        );
+        if t < start || t > end {
+            return Err(BsplineCutError::OutsideDomain {
+                parameter: t,
+                start,
+                end,
+            });
+        }
+        if t == start || t == end {
+            let point = self.subs(t);
+            if !finite_control(&point) {
+                return Err(BsplineCutError::NonFiniteArithmetic);
             }
-        };
-        let s = if t.near(&self.knot_vec[idx]) {
-            t = self.knot_vec[idx];
-            self.knot_vec.multiplicity(idx)
+            let boundary = Self::new_unchecked(KnotVector::from(vec![t, t]), vec![point]);
+            if t == start {
+                let right = self.clone();
+                *self = boundary;
+                return Ok(right);
+            }
+            return Ok(boundary);
+        }
+        let mut split = self.clone();
+        let idx = split
+            .knot_vec
+            .floor(t)
+            .ok_or(BsplineCutError::InvalidSpline)?;
+        let multiplicity = if t == split.knot_vec[idx] {
+            split.knot_vec.strict_multiplicity(idx)
         } else {
             0
         };
-
-        for _ in s..=degree {
-            self.add_knot(t);
+        if multiplicity > degree + 1 {
+            return Err(BsplineCutError::DegenerateSplit);
         }
-
-        // SAFETY: `t` was just added with full multiplicity, so it exists in the knot vector.
-        let k = self.knot_vec.floor(t).unwrap();
-        let m = self.knot_vec.len();
-        let n = self.control_points.len();
-        let knot_vec0 = self.knot_vec.sub_vec(0..=k);
-        let knot_vec1 = self.knot_vec.sub_vec((k - degree)..m);
-        let control_points0 = Vec::from(&self.control_points[0..(k - degree)]);
-        let control_points1 = Vec::from(&self.control_points[(k - degree)..n]);
-        *self = BsplineCurve::new_unchecked(knot_vec0, control_points0);
-        BsplineCurve::new_unchecked(knot_vec1, control_points1)
+        for _ in multiplicity..=degree {
+            split.add_knot(t);
+            if split
+                .control_points
+                .iter()
+                .any(|point| !finite_control(point))
+            {
+                return Err(BsplineCutError::NonFiniteArithmetic);
+            }
+        }
+        let k = split
+            .knot_vec
+            .floor(t)
+            .ok_or(BsplineCutError::InvalidSpline)?;
+        let first_right = k
+            .checked_sub(degree)
+            .filter(|index| *index > 0 && *index < split.control_points.len())
+            .ok_or(BsplineCutError::DegenerateSplit)?;
+        let left = Self::new_unchecked(
+            split.knot_vec.sub_vec(0..=k),
+            split.control_points[..first_right].to_vec(),
+        );
+        let right = Self::new_unchecked(
+            split.knot_vec.sub_vec(first_right..split.knot_vec.len()),
+            split.control_points[first_right..].to_vec(),
+        );
+        let left_degree = cut_degree(&left.knot_vec, left.control_points.len())?;
+        let right_degree = cut_degree(&right.knot_vec, right.control_points.len())?;
+        if left.knot_vec[left_degree] != start
+            || left.knot_vec[left.control_points.len()] != t
+            || right.knot_vec[right_degree] != t
+            || right.knot_vec[right.control_points.len()] != end
+        {
+            return Err(BsplineCutError::DegenerateSplit);
+        }
+        *self = left;
+        Ok(right)
     }
+}
+
+impl<P: ControlPoint<f64> + Tolerance> Cut for BsplineCurve<P> {
+    /// Splits at the exact stored parameter, with the contract of [`Self::try_cut`].
+    ///
+    /// # Panics
+    ///
+    /// Panics on an unsupported split instead of substituting snapped geometry.
+    fn cut(&mut self, t: f64) -> Self { self.try_cut(t).unwrap_or_else(|error| panic!("{error}")) }
 }
 
 impl<P: ControlPoint<f64> + Tolerance> Concat<BsplineCurve<P>> for BsplineCurve<P> {
