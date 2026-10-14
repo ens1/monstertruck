@@ -6,6 +6,22 @@ use serde::{Deserializer, de::Error};
 const MAX_TRACE_CONTROLS: usize = 32_768;
 type BoxedParameterTraces = Box<[BsplineCurve<Point2>; 2]>;
 
+pub(super) fn validate_tubes(tubes: &[SurfaceParameterTube]) -> bool {
+    (1..=8_192).contains(&tubes.len())
+        && tubes.iter().all(|tube| {
+            tube.parameter_range.0.is_finite()
+                && tube.parameter_range.1.is_finite()
+                && tube.parameter_range.0 < tube.parameter_range.1
+                && tube
+                    .uv_bounds
+                    .iter()
+                    .all(|(low, high)| low.is_finite() && high.is_finite() && low < high)
+        })
+        && tubes
+            .windows(2)
+            .all(|pair| pair[0].parameter_range.1 == pair[1].parameter_range.0)
+}
+
 pub(super) fn validate(traces: &[BsplineCurve<Point2>; 2]) -> bool {
     let valid = |trace: &BsplineCurve<Point2>| {
         let controls = trace.control_points();

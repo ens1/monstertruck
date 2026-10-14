@@ -577,6 +577,11 @@ where
                         .add_independent_loop(BoundaryWire::new(poly_wire.clone(), status0));
                     poly_loops_store1[face_index1]
                         .add_independent_loop(BoundaryWire::new(poly_wire, status1));
+                    stage = "whole-span continuation admission";
+                    match intersection_curve.admit_continuation(TOLERANCE) {
+                        Ok(()) | Err(super::super::ContinuationError::UnsupportedCarrier) => {}
+                        Err(_) => return None,
+                    }
                     let geom_wire = create_independent_loop(intersection_curve);
                     geom_loops_store0[face_index0]
                         .add_independent_loop(BoundaryWire::new(geom_wire.clone(), status0));
@@ -642,6 +647,11 @@ where
                             tol,
                         )?;
                         intersection_curve.snap_endpoint(false, gv1.point())?;
+                    }
+                    stage = "whole-span continuation admission";
+                    match intersection_curve.admit_continuation(TOLERANCE) {
+                        Ok(()) | Err(super::super::ContinuationError::UnsupportedCarrier) => {}
+                        Err(_) => return None,
                     }
                     let pedge = Edge::new(&pv0, &pv1, polyline);
                     let gedge = Edge::new(&gv0, &gv1, intersection_curve.into());

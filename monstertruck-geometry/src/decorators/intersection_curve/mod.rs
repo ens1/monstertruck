@@ -159,6 +159,7 @@ impl<C, S0, S1, T0, T1> SurfaceCurve<C, S0, S1, T0, T1> {
             boundary1,
             branch_halfspaces: Vec::new(),
             parameter_traces: None,
+            parameter_tubes: None,
         }
     }
     /// Retains only intersection points in the positive half-space of this plane.
@@ -170,6 +171,7 @@ impl<C, S0, S1, T0, T1> SurfaceCurve<C, S0, S1, T0, T1> {
             return None;
         }
         self.branch_halfspaces.push((origin, normal.normalize()));
+        self.parameter_tubes = None;
         Some(self)
     }
     /// Returns the half-space planes restricting the chosen intersection branch.
@@ -190,11 +192,49 @@ impl<C, S0, S1, T0, T1> SurfaceCurve<C, S0, S1, T0, T1> {
     pub fn with_parameter_traces(mut self, traces: [BsplineCurve<Point2>; 2]) -> Option<Self> {
         parameter_traces::validate(&traces).then_some(())?;
         self.parameter_traces = Some(Box::new(traces));
+        self.parameter_tubes = None;
         Some(self)
     }
     /// Removes continuation hints while retaining exact boundaries and branch constraints.
     #[inline(always)]
-    pub fn clear_parameter_traces(&mut self) { self.parameter_traces = None; }
+    pub fn clear_parameter_traces(&mut self) {
+        self.parameter_traces = None;
+        self.parameter_tubes = None;
+    }
+    /// Returns permitted parameter neighborhoods for the current intersection branch.
+    pub fn parameter_tubes(&self) -> Option<&[SurfaceParameterTube]> {
+        self.parameter_tubes.as_deref()
+    }
+    /// Installs bounded, ordered UV neighborhoods as native branch restrictions.
+    ///
+    /// The intervals must cover the retained trace frame without gaps. Installing
+    /// tubes never substitutes for proof on the current geometry. Serde omits
+    /// these transient restrictions, so consumers requiring bounded admission
+    /// must reprove and reinstall them after loading.
+    pub fn with_parameter_tubes(mut self, tubes: Vec<SurfaceParameterTube>) -> Option<Self> {
+        parameter_traces::validate_tubes(&tubes).then_some(())?;
+        let range = self.parameter_traces.as_ref()?[0].range_tuple();
+        if tubes.first()?.parameter_range.0 != range.0 || tubes.last()?.parameter_range.1 != range.1
+        {
+            return None;
+        }
+        self.parameter_tubes = Some(tubes.into_boxed_slice());
+        Some(self)
+    }
+    fn admits_parameter_point(&self, t: f64, uv0: Point2, uv1: Point2) -> bool {
+        self.parameter_tubes.as_ref().is_none_or(|tubes| {
+            let values = [uv0.x, uv0.y, uv1.x, uv1.y];
+            tubes.iter().any(|tube| {
+                tube.parameter_range.0 <= t
+                    && t <= tube.parameter_range.1
+                    && tube
+                        .uv_bounds
+                        .iter()
+                        .zip(values)
+                        .all(|((low, high), value)| *low <= value && value <= *high)
+            })
+        })
+    }
     /// Copies continuation hints and branch constraints from another surface curve.
     ///
     /// Use this when changing the leader or exact boundary representation while
@@ -204,6 +244,7 @@ impl<C, S0, S1, T0, T1> SurfaceCurve<C, S0, S1, T0, T1> {
         source: &SurfaceCurve<D, R0, R1, U0, U1>,
     ) -> Self {
         self.parameter_traces = source.parameter_traces.clone();
+        self.parameter_tubes = source.parameter_tubes.clone();
         self.branch_halfspaces = source.branch_halfspaces.clone();
         self
     }
@@ -215,6 +256,7 @@ impl<C, S0, S1, T0, T1> SurfaceCurve<C, S0, S1, T0, T1> {
         planes: impl IntoIterator<Item = (Point3, Vector3)>,
     ) -> Self {
         self.branch_halfspaces.extend(planes);
+        self.parameter_tubes = None;
         self
     }
     fn admits_branch_point(&self, point: Point3) -> bool {
@@ -238,13 +280,22 @@ impl<C, S0, S1, T0, T1> SurfaceCurve<C, S0, S1, T0, T1> {
     pub fn leader(&self) -> &C { &self.leader }
     /// This curve is carried by `self.surface0()` and `self.surface1()`.
     #[inline(always)]
-    pub fn surface0_mut(&mut self) -> &mut S0 { &mut self.surface0 }
+    pub fn surface0_mut(&mut self) -> &mut S0 {
+        self.parameter_tubes = None;
+        &mut self.surface0
+    }
     /// This curve is carried by `self.surface0()` and `self.surface1()`.
     #[inline(always)]
-    pub fn surface1_mut(&mut self) -> &mut S1 { &mut self.surface1 }
+    pub fn surface1_mut(&mut self) -> &mut S1 {
+        self.parameter_tubes = None;
+        &mut self.surface1
+    }
     /// Returns the 3D leader curve.
     #[inline(always)]
-    pub fn leader_mut(&mut self) -> &mut C { &mut self.leader }
+    pub fn leader_mut(&mut self) -> &mut C {
+        self.parameter_tubes = None;
+        &mut self.leader
+    }
     /// Returns the exact face-local boundary on `surface0`, if available.
     #[inline(always)]
     pub fn boundary0(&self) -> Option<&T0> { self.boundary0.as_ref() }
@@ -410,6 +461,7 @@ where
         )
         .filter(|(point, _, _)| self.admits_branch_point(*point))?;
         parameter_traces::align_triple(triple, hints, self.surface0(), self.surface1())
+            .filter(|(_, uv0, uv1)| self.admits_parameter_point(t, *uv0, *uv1))
     }
     /// Search triple value of the point nearest to `point`.
     /// - the coordinate on 3D space
@@ -421,7 +473,10 @@ where
         hint0: Option<(f64, f64)>,
         hint1: Option<(f64, f64)>,
         trials: usize,
-    ) -> Option<(Point3, Point2, Point2)> {
+    ) -> Option<(Point3, Point2, Point2)>
+    where
+        C: SearchNearestParameter<CurveParameter, Point = Point3>,
+    {
         let hints = self.parameter_traces.as_ref().and_then(|traces| {
             let nearest = self
                 .surface0
@@ -444,6 +499,11 @@ where
             .filter(|(point, _, _)| self.admits_branch_point(*point))
             .and_then(|triple| {
                 parameter_traces::align_triple(triple, hints, self.surface0(), self.surface1())
+            })
+            .filter(|(point, uv0, uv1)| {
+                self.leader
+                    .search_nearest_parameter(*point, None, trials)
+                    .is_some_and(|t| self.admits_parameter_point(t, *uv0, *uv1))
             })
     }
 }
@@ -815,18 +875,57 @@ where
 {
     #[inline(always)]
     fn cut(&mut self, t: f64) -> Self {
+        let leader = self.leader.cut(t);
+        let left_range = self.leader.range_tuple();
+        let right_range = leader.range_tuple();
+        let actual_split = left_range.1;
         let traces = self
             .parameter_traces
             .as_mut()
-            .map(|traces| Box::new([traces[0].cut(t), traces[1].cut(t)]));
+            .map(|traces| Box::new([traces[0].cut(actual_split), traces[1].cut(actual_split)]));
+        let tubes = self.parameter_tubes.take();
+        let clip = |range: (f64, f64), traces: Option<&[BsplineCurve<Point2>; 2]>| {
+            let traces = traces?;
+            if traces.iter().any(|trace| trace.range_tuple() != range) {
+                return None;
+            }
+            let tubes = tubes.as_ref()?;
+            let clipped = tubes
+                .iter()
+                .filter_map(|tube| {
+                    let mut tube = *tube;
+                    tube.parameter_range = (
+                        tube.parameter_range.0.max(range.0),
+                        tube.parameter_range.1.min(range.1),
+                    );
+                    (tube.parameter_range.0 < tube.parameter_range.1).then_some(tube)
+                })
+                .collect::<Vec<_>>();
+            if !parameter_traces::validate_tubes(&clipped)
+                || clipped.first()?.parameter_range.0 != range.0
+                || clipped.last()?.parameter_range.1 != range.1
+            {
+                return None;
+            }
+            Some(clipped.into_boxed_slice())
+        };
+        self.parameter_tubes = clip(left_range, self.parameter_traces.as_deref());
+        let right_tubes = clip(right_range, traces.as_deref());
         Self {
             surface0: self.surface0.clone(),
             surface1: self.surface1.clone(),
-            leader: self.leader.cut(t),
-            boundary0: self.boundary0.as_mut().map(|boundary| boundary.cut(t)),
-            boundary1: self.boundary1.as_mut().map(|boundary| boundary.cut(t)),
+            leader,
+            boundary0: self
+                .boundary0
+                .as_mut()
+                .map(|boundary| boundary.cut(actual_split)),
+            boundary1: self
+                .boundary1
+                .as_mut()
+                .map(|boundary| boundary.cut(actual_split)),
             branch_halfspaces: self.branch_halfspaces.clone(),
             parameter_traces: traces,
+            parameter_tubes: right_tubes,
         }
     }
 }
@@ -838,6 +937,18 @@ where
     T1: Invertible,
 {
     fn invert(&mut self) {
+        if let Some(traces) = &self.parameter_traces {
+            let (a, b) = traces[0].range_tuple();
+            if let Some(tubes) = &mut self.parameter_tubes {
+                tubes.iter_mut().for_each(|tube| {
+                    tube.parameter_range = (
+                        a + b - tube.parameter_range.1,
+                        a + b - tube.parameter_range.0,
+                    )
+                });
+                tubes.reverse();
+            }
+        }
         self.leader.invert();
         if let Some(traces) = &mut self.parameter_traces {
             traces.iter_mut().for_each(Invertible::invert);
@@ -915,6 +1026,7 @@ where
     T1: Transformed<Matrix4>,
 {
     fn transform_by(&mut self, trans: Matrix4) {
+        self.parameter_tubes = None;
         let normal_transform = trans.invert().map(|inverse| inverse.transpose());
         self.branch_halfspaces
             .iter_mut()

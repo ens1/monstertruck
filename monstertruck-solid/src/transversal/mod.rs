@@ -4,7 +4,12 @@
 // points in `integrate` return `ShapeOpsError::NoBackend`.
 #[cfg(feature = "marching-ssi")]
 mod classic;
+mod continuation;
 mod integrate;
+pub use continuation::{
+    ContinuationCertificate, ContinuationError, certify_intersection_continuation,
+    certify_intersection_continuation_with_halfspaces,
+};
 // Retained legacy chaining fixtures; production uses the checked classic assembler.
 #[cfg(all(feature = "marching-ssi", test))]
 mod polyline_construction;

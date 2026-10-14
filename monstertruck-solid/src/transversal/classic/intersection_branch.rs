@@ -26,6 +26,26 @@ impl<S: ShapeOpsSurface> IntersectionBranch<S> {
         }
     }
     pub(super) fn bind(&mut self, faces: [FaceId<S>; 2]) { self.source_faces = Some(faces); }
+    pub(super) fn admit_continuation(
+        &mut self,
+        precision: f64,
+    ) -> std::result::Result<(), super::super::ContinuationError> {
+        let certificate = super::super::certify_intersection_continuation(
+            self.curve.leader(),
+            self.curve.surface0(),
+            self.curve.surface1(),
+            self.curve
+                .parameter_traces()
+                .ok_or(super::super::ContinuationError::InvalidData)?,
+            precision,
+        )?;
+        self.curve = self
+            .curve
+            .clone()
+            .with_parameter_tubes(certificate.parameter_tubes)
+            .ok_or(super::super::ContinuationError::InvalidData)?;
+        Ok(())
+    }
     fn side(&self, face: FaceId<S>) -> Option<usize> {
         self.source_faces?.iter().position(|source| *source == face)
     }

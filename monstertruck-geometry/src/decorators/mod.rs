@@ -296,6 +296,9 @@ pub struct IntersectionCurve<C, S0, S1> {
 ///
 /// Its 3D evaluation and fallible tessellation have the same projection and failure
 /// semantics as [`IntersectionCurve`]; its leader is not a geometric substitute.
+/// Paired UV traces are retained hints, not exact pcurves. Optional parameter
+/// tubes are transient restrictions rebuilt by the consumer's native admission
+/// step after loading or modifying the source geometry; serde omits them.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, SelfSameGeometry)]
 pub struct SurfaceCurve<C, S0, S1, T0, T1> {
     surface0: S0,
@@ -311,6 +314,19 @@ pub struct SurfaceCurve<C, S0, S1, T0, T1> {
         deserialize_with = "intersection_curve::deserialize_parameter_traces"
     )]
     parameter_traces: Option<Box<[BsplineCurve<Point2>; 2]>>,
+    #[serde(skip)]
+    parameter_tubes: Option<Box<[SurfaceParameterTube]>>,
+}
+
+/// A permitted UV neighborhood for native intersection evaluation on one leader span.
+///
+/// This is a geometric branch restriction, not a trusted continuation certificate.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct SurfaceParameterTube {
+    /// Closed interval in the leader's parameter frame.
+    pub parameter_range: (f64, f64),
+    /// Closed parameter bounds for `(u0, v0, u1, v1)` on the two carriers.
+    pub uv_bounds: [(f64, f64); 4],
 }
 
 /// trimmed curve for parametric curve
