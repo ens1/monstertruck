@@ -51,7 +51,7 @@ impl StepFormat for MonstertruckRepresentationContext {
 #{length_unit_idx} = ( LENGTH_UNIT() NAMED_UNIT(*) SI_UNIT({length_prefix},.METRE.));
 #{plane_angle_unit_idx} = ( NAMED_UNIT(*) PLANE_ANGLE_UNIT() SI_UNIT($,.RADIAN.) );
 #{solid_angle_unit_idx} = ( NAMED_UNIT(*) SI_UNIT($,.STERADIAN.) SOLID_ANGLE_UNIT() );
-#{tolerance_idx} = UNCERTAINTY_MEASURE_WITH_UNIT({accuracy}, \
+#{tolerance_idx} = UNCERTAINTY_MEASURE_WITH_UNIT(LENGTH_MEASURE({accuracy}), \
 #{length_unit_idx}, 'distance_accuracy_value', 'confusion accuracy');\n"
         ))
     }
@@ -244,7 +244,9 @@ impl ConstStepLength for EdgeDisplay<'_> {
 
 impl StepLength for EdgeDisplay<'_> {
     #[inline]
-    fn step_length(&self) -> usize { Self::LENGTH }
+    fn step_length(&self) -> usize {
+        Self::LENGTH
+    }
 }
 
 /// Complete STEP product representation derived from an [`Assembly`].
@@ -303,7 +305,9 @@ impl<Model, Models, Matrix> StepDesign<Model, Models, Matrix> {
 
     /// Returns the length unit and distance accuracy written into the preamble.
     #[inline]
-    pub fn measurement_context(&self) -> StepMeasurementContext { self.measurement_context }
+    pub fn measurement_context(&self) -> StepMeasurementContext {
+        self.measurement_context
+    }
 }
 
 impl<Model> StepDesign<Model, Option<Model>, Matrix4> {
