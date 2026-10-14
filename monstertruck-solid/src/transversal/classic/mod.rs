@@ -8,9 +8,8 @@
 //! `symmetric_difference` here.
 //!
 //! Graft-boundary adaptations vs. the 0.3.2 source (all documented inline):
-//! - The Alternative intersection-curve arm is a raw
-//!   `IntersectionCurve<PolylineCurve<Point3>, S, S>` (0.3.2 wrapped it with
-//!   parameter polylines the pipeline never consumed).
+//! - The temporary intersection arm preserves paired native UV continuation
+//!   traces and exact producing face-use identities through splitting.
 //! - `altshell_to_shell` converts that arm back to `C` via
 //!   `SurfaceCurve::with_boundaries(..).into()` (the conversion the current
 //!   `ShapeOpsCurve` bound provides), not `IntersectionCurve::new(..).into()`.
@@ -21,6 +20,7 @@
 
 mod divide_face;
 mod faces_classification;
+mod intersection_branch;
 mod intersection_curve;
 mod loops_store;
 mod planar;
@@ -34,7 +34,7 @@ use std::iter;
 
 type ClassicResult<T> = std::result::Result<T, ShapeOpsError>;
 
-type AltCurve<C, S> = Alternative<C, IntersectionCurve<PolylineCurve<Point3>, S, S>>;
+type AltCurve<C, S> = Alternative<C, intersection_branch::IntersectionBranch<S>>;
 type AltCurveShell<C, S> = Shell<Point3, AltCurve<C, S>, S>;
 
 // These limits bound the quadratic face-pair stage and the linear classification
@@ -295,10 +295,8 @@ fn classify_face<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
     Ok(classification)
 }
 
-/// Convert an Alternative-curve shell back to a target-curve shell, approximating
-/// each intersection-curve arm with a polyline B-spline wrapped in a
-/// `SurfaceCurve` (uses the `From<SurfaceCurve<BsplineCurve<Point3>, ..>>`
-/// conversion the current `ShapeOpsCurve` bound guarantees).
+/// Convert temporary intersection branches without dropping their paired UV
+/// continuation hints, exact pcurves, branch constraints or parameter frame.
 fn altshell_to_shell<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
     altshell: &AltCurveShell<C, S>,
 ) -> Option<Shell<Point3, C, S>> {
@@ -306,31 +304,7 @@ fn altshell_to_shell<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
         |p| Some(*p),
         |c| match c {
             Alternative::FirstType(c) => Some(c.clone()),
-            Alternative::SecondType(ic) => {
-                let surface0 = ic.surface0().clone();
-                let surface1 = ic.surface1().clone();
-                let mut points = ic.leader().as_slice().to_vec();
-                points.dedup_by(|lhs, rhs| (*lhs).near(&*rhs));
-                if points.len() < 2 {
-                    return None;
-                }
-                let denominator = (points.len() - 1) as f64;
-                let knot_vec = KnotVector::from(
-                    iter::once(0.0)
-                        .chain((0..points.len()).map(|index| index as f64 / denominator))
-                        .chain(iter::once(1.0))
-                        .collect::<Vec<_>>(),
-                );
-                let bspline = BsplineCurve::new(knot_vec, points);
-                let boundary0: Option<ParameterCurve<BoundaryCurve2D, S>> = None;
-                let boundary1: Option<ParameterCurve<BoundaryCurve2D, S>> = None;
-                Some(
-                    SurfaceCurve::with_boundaries(
-                        surface0, surface1, bspline, boundary0, boundary1,
-                    )
-                    .into(),
-                )
-            }
+            Alternative::SecondType(ic) => Some(ic.curve.clone().into()),
         },
         |s| Some(s.clone()),
     )
@@ -376,14 +350,23 @@ fn process_one_pair_of_shells<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
         geom_loops_store0: loops_store0,
         geom_loops_store1: loops_store1,
         ..
-    } = loops_store::create_loops_stores(&altshell0, &poly_shell0, &altshell1, &poly_shell1, tol)
-        .ok_or(ShapeOpsError::IntersectionLoopsFailed)?;
-    let mut cls0 = divide_face::divide_faces(&altshell0, &loops_store0, tol)
-        .ok_or(ShapeOpsError::DivideFacesFailed { shell_index: 0 })?;
+    } = loops_store::create_loops_stores(&altshell0, &poly_shell0, &altshell1, &poly_shell1, tol)?;
+    let mut cls0 = divide_face::divide_faces(&altshell0, &loops_store0, tol).map_err(
+        |(face_index, stage)| ShapeOpsError::ParameterDomainFailed {
+            shell_index: 0,
+            face_index,
+            stage,
+        },
+    )?;
     cls0.integrate_by_component()
         .ok_or(ShapeOpsError::UnknownClassificationFailed { shell_index: 0 })?;
-    let mut cls1 = divide_face::divide_faces(&altshell1, &loops_store1, tol)
-        .ok_or(ShapeOpsError::DivideFacesFailed { shell_index: 1 })?;
+    let mut cls1 = divide_face::divide_faces(&altshell1, &loops_store1, tol).map_err(
+        |(face_index, stage)| ShapeOpsError::ParameterDomainFailed {
+            shell_index: 1,
+            face_index,
+            stage,
+        },
+    )?;
     cls1.integrate_by_component()
         .ok_or(ShapeOpsError::UnknownClassificationFailed { shell_index: 1 })?;
     let [mut and0, mut or0, unknown0] = cls0.and_or_unknown();

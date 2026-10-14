@@ -502,7 +502,7 @@ fn inside<C, S>(
         let t = attempt as f64 + 0.371;
         let ray = Vector3::new(
             1.0,
-            (t * 1.618033988749895).sin(),
+            (t * std::f64::consts::GOLDEN_RATIO).sin(),
             (t * 2.414213562373095).cos(),
         )
         .normalize();

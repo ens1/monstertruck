@@ -2,8 +2,9 @@
 //!
 //! Ported verbatim from the published 0.3.2 crate's `transversal::loops_store`,
 //! adjusted only for the graft: the marching intersection-curve backend now
-//! yields a raw [`IntersectionCurve`] leader (the 0.3.2 parameter wrapper was
-//! dropped), so the `.into()` that unwrapped the wrapper is gone.
+//! retains an implicit native surface curve with paired UV continuation hints
+//! and producing face identities. Its geometric boundary is never the mesh
+//! polyline or an interpolated UV trace.
 
 #![allow(clippy::many_single_char_names)]
 
@@ -54,7 +55,9 @@ impl<P, C> BoundaryWire<P, C> {
 }
 
 impl ShapesOpStatus {
-    fn from_is_curve<C, S0, S1>(curve: &IntersectionCurve<C, S0, S1>) -> Option<ShapesOpStatus>
+    fn from_is_curve<C, S0, S1, T0: Clone, T1: Clone>(
+        curve: &SurfaceCurve<C, S0, S1, T0, T1>,
+    ) -> Option<ShapesOpStatus>
     where
         C: ParametricCurve3D + BoundedCurve,
         S0: ParametricSurface3D + SearchNearestParameter<SurfaceParameter, Point = Point3>,
@@ -518,16 +521,13 @@ pub(super) fn create_loops_stores<C, S>(
     geom_shell1: &Shell<Point3, C, S>,
     poly_shell1: &Shell<Point3, PolylineCurve, Option<PolygonMesh>>,
     tol: f64,
-) -> Option<LoopsStoreQuadruple<C>>
+) -> super::ClassicResult<LoopsStoreQuadruple<C>>
 where
     C: SearchNearestParameter<CurveParameter, Point = Point3>
         + SearchParameter<CurveParameter, Point = Point3>
         + Cut<Point = Point3, Vector = Vector3>
-        + From<IntersectionCurve<PolylineCurve, S, S>>,
-    S: ParametricSurface3D
-        + Clone
-        + SearchParameter<SurfaceParameter, Point = Point3>
-        + SearchNearestParameter<SurfaceParameter, Point = Point3>,
+        + From<super::intersection_branch::IntersectionBranch<S>>,
+    S: super::ShapeOpsSurface,
 {
     let mut geom_loops_store0: LoopsStore<_, _> = geom_shell0.face_iter().collect();
     let mut poly_loops_store0: LoopsStore<_, _> = poly_shell0.face_iter().collect();
@@ -536,15 +536,20 @@ where
     let store0_len = geom_loops_store0.len();
     let store1_len = geom_loops_store1.len();
     let mut intersection_work = 0;
+    let mut pair = (0, 0);
+    let mut stage = "classification mesh admission";
     (0..store0_len)
         .flat_map(move |i| (0..store1_len).map(move |j| (i, j)))
         .try_for_each(|(face_index0, face_index1)| {
+            pair = (face_index0, face_index1);
+            stage = "classification mesh admission";
             let ori0 = geom_shell0[face_index0].orientation();
             let ori1 = geom_shell1[face_index1].orientation();
             let surface0 = geom_shell0[face_index0].surface();
             let surface1 = geom_shell1[face_index1].surface();
             let polygon0 = poly_shell0[face_index0].surface()?;
             let polygon1 = poly_shell1[face_index1].surface()?;
+            stage = "bounded intersection search and paired UV continuation";
             intersection_curve::intersection_curves(
                 surface0.clone(),
                 &polygon0,
@@ -555,13 +560,17 @@ where
             )?
             .into_iter()
             .try_for_each(|(polyline, mut intersection_curve)| {
-                let status = ShapesOpStatus::from_is_curve(&intersection_curve)?;
+                stage = "transversal branch orientation";
+                intersection_curve
+                    .bind([geom_shell0[face_index0].id(), geom_shell1[face_index1].id()]);
+                let status = ShapesOpStatus::from_is_curve(&intersection_curve.curve)?;
                 let (status0, status1) = match (ori0, ori1) {
                     (true, true) => (status, status.not()),
                     (true, false) => (status.not(), status.not()),
                     (false, true) => (status, status),
                     (false, false) => (status.not(), status),
                 };
+                stage = "shared native boundary endpoints and intersection-loop assembly";
                 if polyline.front().near(&polyline.back()) {
                     let poly_wire = create_independent_loop(polyline);
                     poly_loops_store0[face_index0]
@@ -576,8 +585,8 @@ where
                 } else {
                     let pv0 = Vertex::new(polyline.front());
                     let pv1 = Vertex::new(polyline.back());
-                    let gv0 = Vertex::new(intersection_curve.leader().front());
-                    let gv1 = Vertex::new(intersection_curve.leader().back());
+                    let gv0 = Vertex::new(intersection_curve.front());
+                    let gv1 = Vertex::new(intersection_curve.back());
                     let mut pemap0 = HashMap::default();
                     let mut pemap1 = HashMap::default();
                     let mut gemap0 = HashMap::default();
@@ -593,8 +602,7 @@ where
                             &mut gemap0,
                             tol,
                         )?;
-                        let polyline = intersection_curve.leader_mut();
-                        *polyline.first_mut().unwrap() = gv0.point();
+                        intersection_curve.snap_endpoint(true, gv0.point())?;
                     }
                     let idx01 =
                         poly_loops_store0.add_polygon_vertex(face_index0, &pv1, &mut pemap1);
@@ -607,8 +615,7 @@ where
                             &mut gemap1,
                             tol,
                         )?;
-                        let polyline = intersection_curve.leader_mut();
-                        *polyline.last_mut().unwrap() = gv1.point();
+                        intersection_curve.snap_endpoint(false, gv1.point())?;
                     }
                     let idx10 =
                         poly_loops_store1.add_polygon_vertex(face_index1, &pv0, &mut pemap0);
@@ -621,8 +628,7 @@ where
                             &mut gemap0,
                             tol,
                         )?;
-                        let polyline = intersection_curve.leader_mut();
-                        *polyline.first_mut().unwrap() = gv0.point();
+                        intersection_curve.snap_endpoint(true, gv0.point())?;
                     }
                     let idx11 =
                         poly_loops_store1.add_polygon_vertex(face_index1, &pv1, &mut pemap1);
@@ -635,8 +641,7 @@ where
                             &mut gemap1,
                             tol,
                         )?;
-                        let polyline = intersection_curve.leader_mut();
-                        *polyline.last_mut().unwrap() = gv1.point();
+                        intersection_curve.snap_endpoint(false, gv1.point())?;
                     }
                     let pedge = Edge::new(&pv0, &pv1, polyline);
                     let gedge = Edge::new(&gv0, &gv1, intersection_curve.into());
@@ -647,6 +652,20 @@ where
                 }
                 Some(())
             })
+        })
+        .ok_or({
+            if intersection_work > intersection_curve::MAX_TRIANGLE_PAIR_WORK {
+                super::ShapeOpsError::ResourceLimit {
+                    stage: "intersection triangle pair visits",
+                    limit: intersection_curve::MAX_TRIANGLE_PAIR_WORK,
+                }
+            } else {
+                super::ShapeOpsError::SurfaceIntersectionFailed {
+                    first_face_index: pair.0,
+                    second_face_index: pair.1,
+                    stage,
+                }
+            }
         })?;
     if geom_loops_store0
         .iter()
@@ -655,9 +674,13 @@ where
         .flat_map(|wire| wire.iter())
         .any(|edge| !edge.is_geometric_consistent())
     {
-        return None;
+        return Err(super::ShapeOpsError::SurfaceIntersectionFailed {
+            first_face_index: pair.0,
+            second_face_index: pair.1,
+            stage: "native edge/vertex consistency",
+        });
     }
-    Some(LoopsStoreQuadruple {
+    Ok(LoopsStoreQuadruple {
         geom_loops_store0,
         poly_loops_store0,
         geom_loops_store1,

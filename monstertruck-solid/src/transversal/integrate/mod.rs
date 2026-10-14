@@ -168,6 +168,30 @@ pub enum ShapeOpsError {
         "failed to construct surface intersection loops; contact or coincident boundaries may require a dedicated operation."
     )]
     IntersectionLoopsFailed,
+    /// Native intersection tracing or topology assembly failed for one face pair.
+    #[error(
+        "surface intersection of faces {first_face_index} and {second_face_index} failed during {stage}; unresolved contact, branch or trim geometry was not substituted."
+    )]
+    SurfaceIntersectionFailed {
+        /// Zero-based face index in the first complete material boundary.
+        first_face_index: usize,
+        /// Zero-based face index in the second complete material boundary.
+        second_face_index: usize,
+        /// Failed bounded native-intersection stage.
+        stage: &'static str,
+    },
+    /// A face could not establish a finite, consistently closed parameter chart.
+    #[error(
+        "parameter-domain division of face {face_index} in operand {shell_index} failed during {stage}."
+    )]
+    ParameterDomainFailed {
+        /// Zero-based input operand index.
+        shell_index: usize,
+        /// Zero-based face index within that operand.
+        face_index: usize,
+        /// Failed face-local trim stage.
+        stage: &'static str,
+    },
     /// A native planar arrangement could not certify its geometry or topology.
     #[error("native planar Boolean arrangement failed during {stage}.")]
     PlanarArrangementFailed {

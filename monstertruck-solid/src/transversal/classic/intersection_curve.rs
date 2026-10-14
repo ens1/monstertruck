@@ -2,10 +2,9 @@
 //!
 //! Extracts the mesh-vs-mesh interference segments for a surface pair, chains
 //! them into polylines, and re-samples each polyline onto both surfaces to
-//! produce a cleaned [`IntersectionCurve`] leader. Ported verbatim from the
-//! published 0.3.2 crate's `transversal::intersection_curve`, except that the
-//! parameter-space polylines the 0.3.2 wrapper carried are dropped here: the
-//! classic loops-store consumes only the 3D leader.
+//! retain a native implicit intersection with paired UV continuation hints.
+//! Mesh interference supplies search seeds; its polylines are not output
+//! boundary geometry and interpolated hints are not exact parameter curves.
 
 use monstertruck_core::cgmath64::*;
 use monstertruck_geometry::prelude::*;
@@ -134,94 +133,17 @@ fn checked_polylines(lines: &[(Point3, Point3)]) -> Option<Vec<Polyline>> {
     used.iter().all(|used| *used).then_some(result)
 }
 
-/// Re-sample a search branch onto both native surfaces. Every accepted point
-/// must agree with both carriers and remain near its original search branch.
-fn build_intersection_curve<S>(
+/// Preserve paired UV continuation samples while re-sampling the native intersection.
+fn build_intersection_curve<S: super::ShapeOpsSurface>(
     surface0: S,
     surface1: S,
     poly: Polyline,
     tol: f64,
-) -> Option<IntersectionCurve<Polyline, S, S>>
-where
-    S: ParametricSurface3D
-        + Clone
-        + SearchParameter<SurfaceParameter, Point = Point3>
-        + SearchNearestParameter<SurfaceParameter, Point = Point3>,
-{
-    let ic = IntersectionCurve::new(surface0.clone(), surface1.clone(), poly);
-    let raw = ic.leader();
-    let len = raw.len();
-    if len < 2 {
-        return None;
-    }
-    let validate = |triple: (Point3, Point2, Point2), seed: Point3| {
-        let (point, uv0, uv1) = triple;
-        if !super::finite_point(point)
-            || !uv0.x.is_finite()
-            || !uv0.y.is_finite()
-            || !uv1.x.is_finite()
-            || !uv1.y.is_finite()
-        {
-            return None;
-        }
-        let q0 = surface0.subs(uv0.x, uv0.y);
-        let q1 = surface1.subs(uv1.x, uv1.y);
-        if !super::finite_point(q0) || !super::finite_point(q1) {
-            return None;
-        }
-        let residual = TOLERANCE;
-        if q0.distance(q1) > residual
-            || point.distance(q0) > residual
-            || point.distance(q1) > residual
-            || point.distance(seed) > 4.0 * tol
-        {
-            return None;
-        }
-        Some(point)
-    };
-    let recover = |t: f64| {
-        let seed = raw.subs(t);
-        ic.search_triple(t, 100)
-            .and_then(|triple| validate(triple, seed))
-            .or_else(|| {
-                ic.search_nearest_point(seed, None, None, 100)
-                    .and_then(|triple| validate(triple, seed))
-            })
-            .or_else(|| {
-                let uv0 = surface0
-                    .search_parameter(seed, None, 100)
-                    .or_else(|| surface0.search_nearest_parameter(seed, None, 100))?;
-                let uv1 = surface1
-                    .search_parameter(seed, None, 100)
-                    .or_else(|| surface1.search_nearest_parameter(seed, None, 100))?;
-                let q0 = surface0.subs(uv0.0, uv0.1);
-                let q1 = surface1.subs(uv1.0, uv1.1);
-                validate((q0.midpoint(q1), uv0.into(), uv1.into()), seed)
-            })
-    };
-    let mut polyline: Polyline = PolylineCurve(Vec::with_capacity(len));
-    for index in 0..len {
-        let point = recover(index as f64)?;
-        if polyline
-            .last()
-            .is_some_and(|previous| previous.distance(point) <= f64::EPSILON)
-        {
-            return None;
-        }
-        polyline.push(point);
-        if index + 1 < len {
-            // Guard against a leader segment passing between different native
-            // branches or a projection singularity hidden between its vertices.
-            recover(index as f64 + 0.5)?;
-        }
-    }
-    if raw[0].near(&raw[len - 1]) {
-        polyline[len - 1] = polyline[0];
-    }
-    Some(IntersectionCurve::new(surface0, surface1, polyline))
+) -> Option<super::intersection_branch::IntersectionBranch<S>> {
+    super::intersection_branch::trace(surface0, surface1, poly.into(), tol)
 }
 
-const MAX_TRIANGLE_PAIR_WORK: usize = 64_000_000;
+pub(super) const MAX_TRIANGLE_PAIR_WORK: usize = 64_000_000;
 
 struct SearchTriangle {
     vertices: [Point3; 3],
@@ -386,11 +308,11 @@ fn checked_interferences(
     Some(result)
 }
 
-type IntersectionTuple<S> = (Polyline, IntersectionCurve<Polyline, S, S>);
+type IntersectionTuple<S> = (Polyline, super::intersection_branch::IntersectionBranch<S>);
 
 /// Marching intersection curves between two trimmed surfaces, keyed by their
 /// tessellated polygon meshes. Returns, per intersection branch, the raw
-/// interference polyline and the cleaned polyline intersection curve.
+/// interference polyline and the native branch with retained continuation data.
 pub(super) fn intersection_curves<S>(
     surface0: S,
     polygon0: &PolygonMesh,
@@ -400,10 +322,7 @@ pub(super) fn intersection_curves<S>(
     work: &mut usize,
 ) -> Option<Vec<IntersectionTuple<S>>>
 where
-    S: ParametricSurface3D
-        + Clone
-        + SearchParameter<SurfaceParameter, Point = Point3>
-        + SearchNearestParameter<SurfaceParameter, Point = Point3>,
+    S: super::ShapeOpsSurface,
 {
     let bounds0: BoundingBox<Point3> = polygon0.positions().iter().copied().collect();
     let bounds1: BoundingBox<Point3> = polygon1.positions().iter().copied().collect();

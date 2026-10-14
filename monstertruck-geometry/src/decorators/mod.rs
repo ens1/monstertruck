@@ -292,7 +292,7 @@ pub struct IntersectionCurve<C, S0, S1> {
     leader: C,
 }
 
-/// Surface curve with exact face-local boundaries on both supporting surfaces.
+/// Surface curve with optional exact face-local boundaries on both supporting surfaces.
 ///
 /// Its 3D evaluation and fallible tessellation have the same projection and failure
 /// semantics as [`IntersectionCurve`]; its leader is not a geometric substitute.
@@ -305,6 +305,12 @@ pub struct SurfaceCurve<C, S0, S1, T0, T1> {
     boundary1: Option<T1>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     branch_halfspaces: Vec<(Point3, Vector3)>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "intersection_curve::deserialize_parameter_traces"
+    )]
+    parameter_traces: Option<Box<[BsplineCurve<Point2>; 2]>>,
 }
 
 /// trimmed curve for parametric curve

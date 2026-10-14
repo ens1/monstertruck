@@ -169,6 +169,11 @@ impl<
         self.surface1().content_hash(state);
         self.boundary0().content_hash(state);
         self.boundary1().content_hash(state);
+        if let Some(traces) = self.parameter_traces() {
+            // Hints change branch selection and therefore belong in the geometry identity.
+            1_u8.content_hash(state);
+            traces.iter().for_each(|trace| trace.content_hash(state));
+        }
         self.branch_halfspaces().len().content_hash(state);
         self.branch_halfspaces()
             .iter()

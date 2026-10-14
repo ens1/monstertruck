@@ -12,9 +12,15 @@ use super::loops_store::*;
 use monstertruck_meshing::prelude::*;
 use monstertruck_topology::*;
 use rustc_hash::FxHashMap as HashMap;
+use std::collections::hash_map::Entry;
 use std::ops::Deref;
 
 const MAX_PARAMETER_POINTS: usize = 1_000_000;
+type DomainResult<T> = std::result::Result<T, &'static str>;
+type FaceDivisionResult<C, S> = std::result::Result<
+    FacesClassification<Point3, super::AltCurve<C, S>, S>,
+    (usize, &'static str),
+>;
 
 fn project_parameter<S>(
     surface: &S,
@@ -53,43 +59,108 @@ where
     (error.is_finite() && error <= tol).then_some(Point2::new(u, v))
 }
 
-fn create_parameter_boundary<C, S>(
-    face: &Face<Point3, C, S>,
-    wire: &Wire<Point3, C>,
-    polys: &mut HashMap<EdgeId<C>, PolylineCurve<Point3>>,
+fn create_parameter_boundary<C: super::ShapeOpsCurve<S>, S: super::ShapeOpsSurface>(
+    face: &Face<Point3, super::AltCurve<C, S>, S>,
+    wire: &Wire<Point3, super::AltCurve<C, S>>,
+    polys: &mut HashMap<EdgeId<super::AltCurve<C, S>>, PolylineCurve<Point3>>,
     tol: f64,
-) -> Option<PolylineCurve<Point2>>
-where
-    C: BoundedCurve<Point = Point3> + ParameterDivision1D<Point = Point3>,
-    S: ParametricSurface3D
-        + SearchParameter<SurfaceParameter, Point = Point3>
-        + SearchNearestParameter<SurfaceParameter, Point = Point3>,
-{
+) -> DomainResult<PolylineCurve<Point2>> {
     let surface = face.surface();
-    let pt = wire.front_vertex()?.point();
-    let p = project_parameter(&surface, pt, None, tol)?;
-    let vec = wire.edge_iter().try_fold(vec![p], |mut vec, edge| {
-        let poly = polys.entry(edge.id()).or_insert_with(|| {
-            let curve = edge.curve();
-            let div = curve.parameter_division(curve.range_tuple(), tol).1;
-            PolylineCurve(div)
-        });
-        if poly.len() < 2 || vec.len().checked_add(poly.len())? > MAX_PARAMETER_POINTS {
-            return None;
+    let mut values: Vec<Point2> = Vec::new();
+    for edge in wire.edge_iter() {
+        let curve = edge.curve();
+        let mut parameters = match &curve {
+            crate::alternative::Alternative::SecondType(branch) => branch
+                .parameter_samples(face.id(), tol)
+                .ok_or("native branch continuation in its producing face")?,
+            crate::alternative::Alternative::FirstType(native) => {
+                if let Some(parameters) = native.parameter_boundary_2d(&surface, tol) {
+                    parameters
+                } else {
+                    if let Entry::Vacant(entry) = polys.entry(edge.id()) {
+                        let points = native
+                            .try_parameter_division(native.range_tuple(), tol)
+                            .ok_or("finite native edge sampling")?
+                            .1;
+                        entry.insert(PolylineCurve(points));
+                    }
+                    let mut hint = None;
+                    polys
+                        .get(&edge.id())
+                        .ok_or("native edge sampling cache")?
+                        .iter()
+                        .map(|point| {
+                            let parameter = project_parameter(&surface, *point, hint, tol)?;
+                            hint = Some(parameter);
+                            Some(parameter)
+                        })
+                        .collect::<Option<Vec<_>>>()
+                        .ok_or("native boundary projection")?
+                }
+            }
+        };
+        if !edge.orientation() {
+            parameters.reverse();
         }
-        let mut p = *vec.last()?;
-        let closure = |q: &Point3| -> Option<Point2> {
-            p = project_parameter(&surface, *q, Some(p), tol)?;
-            Some(p)
-        };
-        let add: Option<Vec<Point2>> = match edge.orientation() {
-            true => poly.iter().skip(1).map(closure).collect(),
-            false => poly.iter().rev().skip(1).map(closure).collect(),
-        };
-        vec.append(&mut add?);
-        Some(vec)
-    })?;
-    Some(PolylineCurve(vec))
+        if parameters.len() < 2
+            || values
+                .len()
+                .checked_add(parameters.len())
+                .ok_or("parameter point budget")?
+                > MAX_PARAMETER_POINTS
+        {
+            return Err("invalid or excessive parameter-boundary samples");
+        }
+        let first = *parameters.first().ok_or("empty parameter boundary")?;
+        let last = *parameters.last().ok_or("empty parameter boundary")?;
+        let on_first = surface.subs(first.x, first.y);
+        let on_last = surface.subs(last.x, last.y);
+        if !on_first.near(&edge.front().point()) || !on_last.near(&edge.back().point()) {
+            return Err("parameter-boundary endpoints do not match their shared vertices");
+        }
+        if parameters
+            .iter()
+            .any(|point| !point.x.is_finite() || !point.y.is_finite())
+        {
+            return Err("non-finite face-local parameters");
+        }
+        if let Some(previous) = values.last() {
+            let offset = |value: f64, seed: f64, period: Option<f64>| {
+                period
+                    .filter(|period| period.is_finite() && *period > 0.0)
+                    .map_or(0.0, |period| ((seed - value) / period).round() * period)
+            };
+            let shift = Vector2::new(
+                offset(first.x, previous.x, surface.period_u()),
+                offset(first.y, previous.y, surface.period_v()),
+            );
+            parameters.iter_mut().for_each(|point| *point += shift);
+            let delta = parameters[0] - previous;
+            let error = delta.x.abs() * surface.uder(previous.x, previous.y).magnitude()
+                + delta.y.abs() * surface.vder(previous.x, previous.y).magnitude();
+            if !error.is_finite() || error > 4.0 * TOLERANCE {
+                return Err("inconsistent face-local coedge junction");
+            }
+            values.extend(parameters.into_iter().skip(1));
+        } else {
+            values.extend(parameters);
+        }
+    }
+    let (first, last) = (
+        *values.first().ok_or("empty parameter loop")?,
+        *values.last().ok_or("empty parameter loop")?,
+    );
+    let delta = last - first;
+    let du = surface.uder(first.x, first.y).magnitude();
+    let dv = surface.vder(first.x, first.y).magnitude();
+    let error = delta.x.abs() * du + delta.y.abs() * dv;
+    if !error.is_finite() || du == 0.0 || dv == 0.0 || error > 4.0 * TOLERANCE {
+        // A nonzero periodic winding needs a seam-aware face chart, not an
+        // invented closing chord in the unwrapped parameter plane.
+        return Err("nonzero periodic winding or singular parameter chart");
+    }
+    *values.last_mut().ok_or("empty parameter loop")? = first;
+    Ok(PolylineCurve(values))
 }
 
 // UV coordinates have arbitrary units, independent scales and origins. A model
@@ -165,28 +236,26 @@ struct WireChunk<'a, C> {
 
 type FaceWithShapesOpStatus<C, S> = (Face<Point3, C, S>, ShapesOpStatus);
 fn divide_one_face<C, S>(
-    face: &Face<Point3, C, S>,
-    loops: &Loops<Point3, C>,
+    face: &Face<Point3, super::AltCurve<C, S>, S>,
+    loops: &Loops<Point3, super::AltCurve<C, S>>,
     tol: f64,
-) -> Option<Vec<FaceWithShapesOpStatus<C, S>>>
+) -> DomainResult<Vec<FaceWithShapesOpStatus<super::AltCurve<C, S>, S>>>
 where
-    C: BoundedCurve<Point = Point3> + ParameterDivision1D<Point = Point3>,
-    S: ParametricSurface3D
-        + SearchParameter<SurfaceParameter, Point = Point3>
-        + SearchNearestParameter<SurfaceParameter, Point = Point3>,
+    C: super::ShapeOpsCurve<S>,
+    S: super::ShapeOpsSurface,
 {
     let (mut pre_faces, mut negative_wires) = (Vec::new(), Vec::new());
     let mut map = HashMap::default();
     loops.iter().try_for_each(|wire| {
         let poly = create_parameter_boundary(face, wire, &mut map, tol)?;
-        match positive_area(&poly)? {
+        match positive_area(&poly).ok_or("unresolved parameter-loop orientation")? {
             true => pre_faces.push(vec![WireChunk { poly, wire }]),
             false => negative_wires.push(WireChunk { poly, wire }),
         }
-        Some(())
+        Ok(())
     })?;
     negative_wires.into_iter().try_for_each(|chunk| {
-        let point = *chunk.poly.first()?;
+        let point = *chunk.poly.first().ok_or("empty parameter hole")?;
         let mut owner: Option<usize> = None;
         for (index, pre_face) in pre_faces.iter().enumerate() {
             let Some(outer) = pre_face.first() else {
@@ -199,7 +268,7 @@ where
             }
         }
         // An orphan hole is a failed split, not an ignorable loop.
-        let owner = owner?;
+        let owner = owner.ok_or("orphan or ambiguous parameter hole")?;
         let outer = &pre_faces[owner][0];
         if outer.wire.deref().inverse() == *chunk.wire.deref() {
             // Cancellation requires the same boundary, not merely equal areas.
@@ -207,7 +276,7 @@ where
         } else {
             pre_faces[owner].push(chunk);
         }
-        Some(())
+        Ok(())
     })?;
     let vec: Vec<_> = pre_faces
         .into_iter()
@@ -221,7 +290,7 @@ where
                 Some(chunk) => chunk.wire.status(),
                 None => ShapesOpStatus::Unknown,
             };
-            let wires: Vec<Wire<Point3, C>> = pre_face
+            let wires: Vec<Wire<Point3, super::AltCurve<C, S>>> = pre_face
                 .into_iter()
                 .map(|chunk| chunk.wire.deref().clone())
                 .collect();
@@ -231,29 +300,31 @@ where
             }
             Some((new_face, status))
         })
-        .collect::<Option<Vec<_>>>()?;
-    Some(vec)
+        .collect::<Option<Vec<_>>>()
+        .ok_or("native split-face topology")?;
+    Ok(vec)
 }
 
 pub(super) fn divide_faces<C, S>(
-    shell: &Shell<Point3, C, S>,
-    loops_store: &LoopsStore<Point3, C>,
+    shell: &Shell<Point3, super::AltCurve<C, S>, S>,
+    loops_store: &LoopsStore<Point3, super::AltCurve<C, S>>,
     tol: f64,
-) -> Option<FacesClassification<Point3, C, S>>
+) -> FaceDivisionResult<C, S>
 where
-    C: BoundedCurve<Point = Point3> + ParameterDivision1D<Point = Point3>,
-    S: ParametricSurface3D
-        + SearchParameter<SurfaceParameter, Point = Point3>
-        + SearchNearestParameter<SurfaceParameter, Point = Point3>,
+    C: super::ShapeOpsCurve<S>,
+    S: super::ShapeOpsSurface,
 {
     if shell.len() != loops_store.len() {
-        return None;
+        return Err((0, "input face/loop cardinality"));
     }
-    let mut res = FacesClassification::<Point3, C, S>::default();
+    let mut face_index = 0;
+    let mut res = FacesClassification::<Point3, super::AltCurve<C, S>, S>::default();
     shell
         .iter()
         .zip(loops_store)
-        .try_for_each(|(face, loops)| {
+        .enumerate()
+        .try_for_each(|(index, (face, loops))| {
+            face_index = index;
             if loops
                 .iter()
                 .all(|wire| wire.status() == ShapesOpStatus::Unknown)
@@ -264,7 +335,8 @@ where
                 vec.into_iter()
                     .for_each(|(face, status)| res.push(face, status));
             }
-            Some(())
-        })?;
-    Some(res)
+            Ok(())
+        })
+        .map_err(|stage| (face_index, stage))?;
+    Ok(res)
 }

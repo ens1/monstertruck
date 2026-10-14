@@ -261,17 +261,15 @@ impl
             ParameterCurve<BoundaryCurve2D, Surface>,
         >,
     ) -> Curve {
-        let branches = c.branch_halfspaces().to_vec();
-        let (surface0, surface1, leader, boundary0, boundary1) = c.destruct_with_boundaries();
         Curve::IntersectionCurve(
             SurfaceCurve::with_boundaries(
-                Box::new(surface0),
-                Box::new(surface1),
-                Box::new(leader.into()),
-                boundary0.map(boundary_curve_2d_to_model_curve),
-                boundary1.map(boundary_curve_2d_to_model_curve),
+                Box::new(c.surface0().clone()),
+                Box::new(c.surface1().clone()),
+                Box::new(c.leader().clone().into()),
+                c.boundary0().cloned().map(boundary_curve_2d_to_model_curve),
+                c.boundary1().cloned().map(boundary_curve_2d_to_model_curve),
             )
-            .with_branch_halfspaces(branches),
+            .with_branch_data_from(&c),
         )
     }
 }
@@ -296,17 +294,15 @@ impl
             ParameterCurve<BoundaryCurve2D, Surface>,
         >,
     ) -> Curve {
-        let branches = c.branch_halfspaces().to_vec();
-        let (surface0, surface1, leader, boundary0, boundary1) = c.destruct_with_boundaries();
         Curve::IntersectionCurve(
             SurfaceCurve::with_boundaries(
-                Box::new(surface0),
-                Box::new(surface1),
-                Box::new(leader.into()),
-                boundary0.map(boundary_curve_2d_to_model_curve),
-                boundary1.map(boundary_curve_2d_to_model_curve),
+                Box::new(c.surface0().clone()),
+                Box::new(c.surface1().clone()),
+                Box::new(c.leader().clone().into()),
+                c.boundary0().cloned().map(boundary_curve_2d_to_model_curve),
+                c.boundary1().cloned().map(boundary_curve_2d_to_model_curve),
             )
-            .with_branch_halfspaces(branches),
+            .with_branch_data_from(&c),
         )
     }
 }

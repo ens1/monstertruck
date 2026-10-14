@@ -2,6 +2,8 @@ use super::*;
 use monstertruck_core::newton::{self, CalcOutput};
 use monstertruck_traits::{ParametricCurve as ParametricCurveTrait, SnapCurveEndpoints};
 mod division;
+mod parameter_traces;
+pub(super) use parameter_traces::deserialize_parameter_traces;
 
 fn finite_point(point: Point3) -> bool {
     point.x.is_finite() && point.y.is_finite() && point.z.is_finite()
@@ -156,6 +158,7 @@ impl<C, S0, S1, T0, T1> SurfaceCurve<C, S0, S1, T0, T1> {
             boundary0,
             boundary1,
             branch_halfspaces: Vec::new(),
+            parameter_traces: None,
         }
     }
     /// Retains only intersection points in the positive half-space of this plane.
@@ -171,6 +174,39 @@ impl<C, S0, S1, T0, T1> SurfaceCurve<C, S0, S1, T0, T1> {
     }
     /// Returns the half-space planes restricting the chosen intersection branch.
     pub fn branch_halfspaces(&self) -> &[(Point3, Vector3)] { &self.branch_halfspaces }
+    /// Returns paired, face-local UV continuation hints in the leader's parameter frame.
+    ///
+    /// These degree-one traces guide native intersection projection. They are
+    /// not geometric trim curves and do not establish exact carrier membership.
+    #[inline(always)]
+    pub fn parameter_traces(&self) -> Option<&[BsplineCurve<Point2>; 2]> {
+        self.parameter_traces.as_deref()
+    }
+    /// Installs bounded UV continuation hints for both supporting surfaces.
+    ///
+    /// Returns `None` for malformed, non-finite, excessively large, or differently
+    /// parameterized traces. The traces must share the leader's parameter frame;
+    /// interpolating them never replaces native intersection evaluation.
+    pub fn with_parameter_traces(mut self, traces: [BsplineCurve<Point2>; 2]) -> Option<Self> {
+        parameter_traces::validate(&traces).then_some(())?;
+        self.parameter_traces = Some(Box::new(traces));
+        Some(self)
+    }
+    /// Removes continuation hints while retaining exact boundaries and branch constraints.
+    #[inline(always)]
+    pub fn clear_parameter_traces(&mut self) { self.parameter_traces = None; }
+    /// Copies continuation hints and branch constraints from another surface curve.
+    ///
+    /// Use this when changing the leader or exact boundary representation while
+    /// retaining its parameter frame and supporting surfaces.
+    pub fn with_branch_data_from<D, R0, R1, U0, U1>(
+        mut self,
+        source: &SurfaceCurve<D, R0, R1, U0, U1>,
+    ) -> Self {
+        self.parameter_traces = source.parameter_traces.clone();
+        self.branch_halfspaces = source.branch_halfspaces.clone();
+        self
+    }
     /// Preserves branch constraints when changing the leader or boundary representation.
     ///
     /// Invalid constraints are retained and cause all subsequent point searches to fail.
@@ -248,12 +284,24 @@ where
     /// - the uv coordinate on `self.surface1()`
     #[inline(always)]
     pub fn search_triple(&self, t: f64, trials: usize) -> Option<(Point3, Point2, Point2)> {
+        self.search_triple_with_hints(t, None, None, trials)
+    }
+    /// Projects the leader at `t` using paired surface-parameter continuation hints.
+    ///
+    /// Hints seed the native solve and never replace carrier evaluation.
+    pub fn search_triple_with_hints(
+        &self,
+        t: f64,
+        hint0: Option<(f64, f64)>,
+        hint1: Option<(f64, f64)>,
+        trials: usize,
+    ) -> Option<(Point3, Point2, Point2)> {
         let point = self.leader.evaluate(t);
         double_projection(
             self.surface0(),
-            None,
+            hint0,
             self.surface1(),
-            None,
+            hint1,
             point,
             self.leader.derivative(t),
             trials,
@@ -336,17 +384,32 @@ where
     /// - the uv coordinate on `self.surface1()`
     #[inline(always)]
     pub fn search_triple(&self, t: f64, trials: usize) -> Option<(Point3, Point2, Point2)> {
+        if let Some(traces) = &self.parameter_traces {
+            let range = self.leader.try_range_tuple();
+            if range? != traces[0].range_tuple()
+                || !t.is_finite()
+                || t < traces[0].range_tuple().0
+                || t > traces[0].range_tuple().1
+            {
+                return None;
+            }
+        }
         let point = self.leader.evaluate(t);
-        double_projection(
+        let hints = self
+            .parameter_traces
+            .as_ref()
+            .map(|traces| [traces[0].subs(t), traces[1].subs(t)]);
+        let triple = double_projection(
             self.surface0(),
-            None,
+            hints.map(|uv| uv[0].into()),
             self.surface1(),
-            None,
+            hints.map(|uv| uv[1].into()),
             point,
             self.leader.derivative(t),
             trials,
         )
-        .filter(|(point, _, _)| self.admits_branch_point(*point))
+        .filter(|(point, _, _)| self.admits_branch_point(*point))?;
+        parameter_traces::align_triple(triple, hints, self.surface0(), self.surface1())
     }
     /// Search triple value of the point nearest to `point`.
     /// - the coordinate on 3D space
@@ -359,14 +422,29 @@ where
         hint1: Option<(f64, f64)>,
         trials: usize,
     ) -> Option<(Point3, Point2, Point2)> {
+        let hints = self.parameter_traces.as_ref().and_then(|traces| {
+            let nearest = self
+                .surface0
+                .search_nearest_parameter(point, hint0, trials)?;
+            let t = traces[0].search_nearest_parameter(Point2::from(nearest), None, trials)?;
+            Some([traces[0].subs(t), traces[1].subs(t)])
+        });
         let intersection = IntersectionCurve::new(
             self.surface0.clone(),
             self.surface1.clone(),
             self.leader.clone(),
         );
         intersection
-            .search_nearest_point(point, hint0, hint1, trials)
+            .search_nearest_point(
+                point,
+                hint0.or_else(|| hints.map(|uv| uv[0].into())),
+                hint1.or_else(|| hints.map(|uv| uv[1].into())),
+                trials,
+            )
             .filter(|(point, _, _)| self.admits_branch_point(*point))
+            .and_then(|triple| {
+                parameter_traces::align_triple(triple, hints, self.surface0(), self.surface1())
+            })
     }
 }
 
@@ -645,50 +723,50 @@ where
             .map_or_else(failed_point, |triple| triple.0)
     }
     fn derivative(&self, t: f64) -> Vector3 {
-        if !self.branch_halfspaces.is_empty() && self.search_triple(t, 100).is_none() {
+        let Some((point, uv0, uv1)) = self.search_triple(t, 100) else {
+            return failed_vector();
+        };
+        let [leader, tangent, curvature] = self.leader.derivatives(2, t).to_array::<3>();
+        let cross = self
+            .surface0
+            .normal(uv0.x, uv0.y)
+            .cross(self.surface1.normal(uv1.x, uv1.y));
+        let denominator = cross.dot(tangent);
+        if !denominator.is_finite() || denominator == 0.0 {
             return failed_vector();
         }
-        IntersectionCurve::new(
-            self.surface0.clone(),
-            self.surface1.clone(),
-            self.leader.clone(),
-        )
-        .derivative(t)
+        cross * ((tangent.magnitude2() - (point - leader).dot(curvature)) / denominator)
     }
-    fn derivative_2(&self, t: f64) -> Vector3 {
-        if !self.branch_halfspaces.is_empty() && self.search_triple(t, 100).is_none() {
-            return failed_vector();
-        }
-        IntersectionCurve::new(
-            self.surface0.clone(),
-            self.surface1.clone(),
-            self.leader.clone(),
-        )
-        .derivative_2(t)
-    }
+    fn derivative_2(&self, t: f64) -> Vector3 { self.derivative_n(2, t) }
     fn derivative_n(&self, n: usize, t: f64) -> Vector3 {
-        if !self.branch_halfspaces.is_empty() && self.search_triple(t, 100).is_none() {
-            return failed_vector();
+        match n {
+            0 => self.evaluate(t).to_vec(),
+            1 => self.derivative(t),
+            _ => self.derivatives(n, t)[n],
         }
-        IntersectionCurve::new(
-            self.surface0.clone(),
-            self.surface1.clone(),
-            self.leader.clone(),
-        )
-        .derivative_n(n, t)
     }
     fn derivatives(&self, n: usize, t: f64) -> CurveDerivatives<Vector3> {
-        if !self.branch_halfspaces.is_empty() && self.search_triple(t, 100).is_none() {
+        let Some((point, uv0, uv1)) = self.search_triple(t, 100) else {
             let mut result = CurveDerivatives::new(n);
             (0..=n).for_each(|index| result[index] = failed_vector());
             return result;
-        }
-        IntersectionCurve::new(
-            self.surface0.clone(),
-            self.surface1.clone(),
-            self.leader.clone(),
-        )
-        .derivatives(n, t)
+        };
+        let mut uv0ders = CurveDerivatives::new(n);
+        uv0ders[0] = uv0.to_vec();
+        let mut uv1ders = CurveDerivatives::new(n);
+        uv1ders[0] = uv1.to_vec();
+        let mut result = CurveDerivatives::new(n);
+        result[0] = point.to_vec();
+        let info = DerRoutineImmutableArgs {
+            s0ders: self.surface0.derivatives(n, uv0.x, uv0.y),
+            s0normal: self.surface0.normal(uv0.x, uv0.y),
+            s1ders: self.surface1.derivatives(n, uv1.x, uv1.y),
+            s1normal: self.surface1.normal(uv1.x, uv1.y),
+            leaders: self.leader.derivatives(n + 1, t),
+        };
+        (1..=n)
+            .for_each(|index| der_routine(&info, &mut uv0ders, &mut uv1ders, &mut result, index));
+        result
     }
     #[inline(always)]
     fn parameter_range(&self) -> ParameterRange { self.leader.parameter_range() }
@@ -737,6 +815,10 @@ where
 {
     #[inline(always)]
     fn cut(&mut self, t: f64) -> Self {
+        let traces = self
+            .parameter_traces
+            .as_mut()
+            .map(|traces| Box::new([traces[0].cut(t), traces[1].cut(t)]));
         Self {
             surface0: self.surface0.clone(),
             surface1: self.surface1.clone(),
@@ -744,6 +826,7 @@ where
             boundary0: self.boundary0.as_mut().map(|boundary| boundary.cut(t)),
             boundary1: self.boundary1.as_mut().map(|boundary| boundary.cut(t)),
             branch_halfspaces: self.branch_halfspaces.clone(),
+            parameter_traces: traces,
         }
     }
 }
@@ -756,6 +839,9 @@ where
 {
     fn invert(&mut self) {
         self.leader.invert();
+        if let Some(traces) = &mut self.parameter_traces {
+            traces.iter_mut().for_each(Invertible::invert);
+        }
         if let Some(boundary) = self.boundary0_mut() {
             boundary.invert();
         }
@@ -780,14 +866,10 @@ where
         hint: H,
         trials: usize,
     ) -> Option<f64> {
-        let intersection = IntersectionCurve::new(
-            self.surface0.clone(),
-            self.surface1.clone(),
-            self.leader.clone(),
-        );
-        intersection
-            .search_parameter(point, hint, trials)
-            .filter(|t| self.search_triple(*t, trials).is_some())
+        let t = self.leader.search_nearest_parameter(point, hint, trials)?;
+        self.search_triple(t, trials)
+            .filter(|triple| triple.0.near(&point))
+            .map(|_| t)
     }
 }
 
@@ -806,14 +888,21 @@ where
         hint: H,
         trials: usize,
     ) -> Option<f64> {
-        let intersection = IntersectionCurve::new(
-            self.surface0.clone(),
-            self.surface1.clone(),
-            self.leader.clone(),
-        );
-        intersection
-            .search_nearest_parameter(point, hint, trials)
-            .filter(|t| self.search_triple(*t, trials).is_some())
+        let t = self.leader.search_nearest_parameter(point, hint, trials)?;
+        let hints = self
+            .parameter_traces
+            .as_ref()
+            .map(|traces| [traces[0].subs(t), traces[1].subs(t)]);
+        let (near_point, _, _) = self.search_nearest_point(
+            point,
+            hints.map(|uv| uv[0].into()),
+            hints.map(|uv| uv[1].into()),
+            trials,
+        )?;
+        let t = self
+            .leader
+            .search_nearest_parameter(near_point, Some(t), trials)?;
+        self.search_triple(t, trials).map(|_| t)
     }
 }
 
