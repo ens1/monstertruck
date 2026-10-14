@@ -152,15 +152,26 @@ impl<I: Clone + IntoIterator<Item = usize>> Display for SliceDisplay<'_, IndexSl
 pub trait StepFormat {
     /// Write the STEP encoding of `self` rooted at entity index `idx`.
     fn fmt(&self, idx: usize, f: &mut Formatter<'_>) -> Result;
+    /// Formats a face-local parameter curve against an already emitted carrier.
+    /// Non-parameter entities retain their ordinary encoding.
+    fn fmt_on_surface(&self, idx: usize, _surface_idx: usize, f: &mut Formatter<'_>) -> Result {
+        self.fmt(idx, f)
+    }
 }
 
 impl<T: StepFormat> StepFormat for &T {
     fn fmt(&self, idx: usize, f: &mut Formatter<'_>) -> Result { StepFormat::fmt(*self, idx, f) }
+    fn fmt_on_surface(&self, idx: usize, surface_idx: usize, f: &mut Formatter<'_>) -> Result {
+        StepFormat::fmt_on_surface(*self, idx, surface_idx, f)
+    }
 }
 
 impl<T: StepFormat> StepFormat for Box<T> {
     fn fmt(&self, idx: usize, f: &mut Formatter<'_>) -> Result {
         StepFormat::fmt(self.as_ref(), idx, f)
+    }
+    fn fmt_on_surface(&self, idx: usize, surface_idx: usize, f: &mut Formatter<'_>) -> Result {
+        StepFormat::fmt_on_surface(self.as_ref(), idx, surface_idx, f)
     }
 }
 
@@ -209,16 +220,20 @@ impl<T: StepFormat> Display for StepDisplay<T> {
 pub trait StepLength {
     /// Calculate how many lines are used in outputting an object to a STEP file
     fn step_length(&self) -> usize;
+    /// Entity count when a parameter curve refers to an existing surface.
+    fn step_length_on_surface(&self) -> usize { self.step_length() }
 }
 
 impl<T: StepLength> StepLength for &T {
     #[inline(always)]
     fn step_length(&self) -> usize { StepLength::step_length(*self) }
+    fn step_length_on_surface(&self) -> usize { StepLength::step_length_on_surface(*self) }
 }
 
 impl<T: StepLength> StepLength for Box<T> {
     #[inline(always)]
     fn step_length(&self) -> usize { self.as_ref().step_length() }
+    fn step_length_on_surface(&self) -> usize { self.as_ref().step_length_on_surface() }
 }
 
 /// Constant numbers of lines for outputting an object to a STEP file.
@@ -270,16 +285,22 @@ pub trait StepSurface {
     /// the parameter `same_sense`.
     #[inline(always)]
     fn same_sense(&self) -> bool { true }
+    /// Whether emitted carrier parameters equal this surface's native frame.
+    /// A formatter that changes its UV frame must omit native PCURVEs until it
+    /// also supplies their coordinate conversion. 3D boundary geometry remains.
+    fn preserves_parameterization(&self) -> bool { false }
 }
 
 impl<T: StepSurface> StepSurface for &T {
     #[inline(always)]
     fn same_sense(&self) -> bool { (*self).same_sense() }
+    fn preserves_parameterization(&self) -> bool { (*self).preserves_parameterization() }
 }
 
 impl<T: StepSurface> StepSurface for Box<T> {
     #[inline(always)]
     fn same_sense(&self) -> bool { self.as_ref().same_sense() }
+    fn preserves_parameterization(&self) -> bool { self.as_ref().preserves_parameterization() }
 }
 
 /// Describe STEP file header

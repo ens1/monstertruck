@@ -159,6 +159,15 @@ pub struct CompressedTrimmedShell<P, C, S, T> {
     pub edges: Vec<CompressedEdge<C>>,
     /// all geometries and boundaries of faces, including optional face-local trims
     pub faces: Vec<CompressedTrimmedFace<S, T>>,
+    /// Stable IDs aligned with the serialized vertices.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vertex_stable_ids: Option<Vec<StableId>>,
+    /// Stable IDs aligned with the serialized shared edges.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub edge_stable_ids: Option<Vec<StableId>>,
+    /// Stable IDs aligned with the serialized faces.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub face_stable_ids: Option<Vec<StableId>>,
 }
 
 /// Serialized compressed solid
@@ -179,9 +188,15 @@ pub struct CompressedSolid<P, C, S> {
 pub struct CompressedTrimmedSolid<P, C, S, T> {
     /// all boundaries of solid
     pub boundaries: Vec<CompressedTrimmedShell<P, C, S, T>>,
+    /// Stable ID allocator state, independent of face-local trim storage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id_allocator: Option<StableIdAllocator>,
+    /// Sparse attributes keyed by the retained stable topology IDs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attributes: Option<SolidAttributes>,
 }
 
-struct CompressDirector<P, C> {
+pub(crate) struct CompressDirector<P, C> {
     vmap: HashMap<VertexId<P>, (usize, P)>,
     emap: HashMap<EdgeId<C>, (usize, CompressedEdge<C>)>,
     vertex_stable_ids: HashMap<VertexId<P>, (usize, StableId)>,
@@ -190,7 +205,7 @@ struct CompressDirector<P, C> {
 
 impl<P: Clone, C: Clone> CompressDirector<P, C> {
     #[inline(always)]
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             vmap: HashMap::default(),
             emap: HashMap::default(),
@@ -212,7 +227,7 @@ impl<P: Clone, C: Clone> CompressDirector<P, C> {
     }
 
     #[inline(always)]
-    fn get_eid(&mut self, edge: &Edge<P, C>) -> CompressedEdgeIndex {
+    pub(crate) fn get_eid(&mut self, edge: &Edge<P, C>) -> CompressedEdgeIndex {
         match self.emap.get(&edge.id()) {
             Some(got) => (got.0, edge.orientation()).into(),
             None => {
@@ -302,12 +317,9 @@ impl<P: Clone, C: Clone> CompressDirector<P, C> {
     }
 
     #[inline(always)]
-    fn vertices_edges(self) -> (Vec<P>, Vec<CompressedEdge<C>>) {
-        (Self::map2vec(self.vmap), Self::map2vec(self.emap))
-    }
-
-    #[inline(always)]
-    fn stable_ids(self) -> (Vec<P>, Vec<CompressedEdge<C>>, Vec<StableId>, Vec<StableId>) {
+    pub(crate) fn stable_ids(
+        self,
+    ) -> (Vec<P>, Vec<CompressedEdge<C>>, Vec<StableId>, Vec<StableId>) {
         let vertices = Self::map2vec(self.vmap);
         let edges = Self::map2vec(self.emap);
         let vsids = Self::map2vec_simple(self.vertex_stable_ids);
@@ -360,11 +372,20 @@ impl<P: Clone, C: Clone, S: Clone> Shell<P, C, S> {
         let mut face_closure =
             |face: &Face<P, C, S>| director.create_trimmed_cface(face, &mut trim_curve);
         let faces = self.iter().map(&mut face_closure).collect();
-        let (vertices, edges) = director.vertices_edges();
+        let (vertices, edges, vsids, esids) = director.stable_ids();
+        let fsids = self.iter().map(Face::stable_id).collect::<Vec<_>>();
+        let assigned = vsids
+            .iter()
+            .chain(&esids)
+            .chain(&fsids)
+            .any(|id| id.is_assigned());
         CompressedTrimmedShell {
             vertices,
             edges,
             faces,
+            vertex_stable_ids: assigned.then_some(vsids),
+            edge_stable_ids: assigned.then_some(esids),
+            face_stable_ids: assigned.then_some(fsids),
         }
     }
 
@@ -597,9 +618,9 @@ impl<P, C, S, T> CompressedTrimmedShell<P, C, S, T> {
                 .into_iter()
                 .map(CompressedTrimmedFace::erase_trims)
                 .collect(),
-            vertex_stable_ids: None,
-            edge_stable_ids: None,
-            face_stable_ids: None,
+            vertex_stable_ids: self.vertex_stable_ids,
+            edge_stable_ids: self.edge_stable_ids,
+            face_stable_ids: self.face_stable_ids,
         }
     }
 
@@ -617,9 +638,9 @@ impl<P, C, S, T> CompressedTrimmedShell<P, C, S, T> {
                 .iter()
                 .map(CompressedTrimmedFace::cloned_without_trims)
                 .collect(),
-            vertex_stable_ids: None,
-            edge_stable_ids: None,
-            face_stable_ids: None,
+            vertex_stable_ids: self.vertex_stable_ids.clone(),
+            edge_stable_ids: self.edge_stable_ids.clone(),
+            face_stable_ids: self.face_stable_ids.clone(),
         }
     }
 }
@@ -633,8 +654,8 @@ impl<P, C, S, T> CompressedTrimmedSolid<P, C, S, T> {
                 .into_iter()
                 .map(CompressedTrimmedShell::erase_trims)
                 .collect(),
-            id_allocator: None,
-            attributes: None,
+            id_allocator: self.id_allocator,
+            attributes: self.attributes,
         }
     }
 
@@ -650,8 +671,8 @@ impl<P, C, S, T> CompressedTrimmedSolid<P, C, S, T> {
                 .iter()
                 .map(CompressedTrimmedShell::cloned_without_trims)
                 .collect(),
-            id_allocator: None,
-            attributes: None,
+            id_allocator: self.id_allocator.clone(),
+            attributes: self.attributes.clone(),
         }
     }
 }
@@ -709,6 +730,9 @@ impl<P: Clone, C: Clone, S: Clone> CompressedShell<P, C, S> {
                     surface: face.surface.clone(),
                 })
                 .collect(),
+            vertex_stable_ids: self.vertex_stable_ids.clone(),
+            edge_stable_ids: self.edge_stable_ids.clone(),
+            face_stable_ids: self.face_stable_ids.clone(),
         }
     }
 
@@ -745,6 +769,8 @@ impl<P: Clone, C: Clone, S: Clone> CompressedSolid<P, C, S> {
                 .iter()
                 .map(|shell| shell.with_face_trims(&mut trim_curve))
                 .collect(),
+            id_allocator: self.id_allocator.clone(),
+            attributes: self.attributes.clone(),
         }
     }
 
@@ -789,6 +815,12 @@ impl<P: Clone, C: Clone, S: Clone> Solid<P, C, S> {
                 .iter()
                 .map(|shell| shell.compress_with_face_trims(&mut trim_curve))
                 .collect(),
+            id_allocator: Some(self.id_allocator.clone()),
+            attributes: if self.attributes.is_empty() {
+                None
+            } else {
+                Some(self.attributes.clone())
+            },
         }
     }
 

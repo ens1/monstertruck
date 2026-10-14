@@ -341,6 +341,9 @@ where
         vertices: healed.vertices,
         edges: healed.edges,
         faces,
+        vertex_stable_ids: healed.vertex_stable_ids,
+        edge_stable_ids: healed.edge_stable_ids,
+        face_stable_ids: healed.face_stable_ids,
     }
 }
 

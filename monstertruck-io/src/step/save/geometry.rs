@@ -403,16 +403,10 @@ where
     S0: StepLength + StepFormat,
     S1: StepLength + StepFormat,
 {
-    fn fmt(&self, idx: usize, f: &mut Formatter<'_>) -> Result {
-        let curve_idx = idx + 1;
-        let surface0_idx = curve_idx + self.leader().step_length();
-        let surface1_idx = surface0_idx + self.surface0().step_length();
-        f.write_fmt(format_args!(
-            "#{idx} = INTERSECTION_CURVE('', #{curve_idx}, (#{surface0_idx}, #{surface1_idx}), .CURVE_3D.);\n"
-        ))?;
-        self.leader().fmt(curve_idx, f)?;
-        self.surface0().fmt(surface0_idx, f)?;
-        self.surface1().fmt(surface1_idx, f)
+    fn fmt(&self, _idx: usize, _f: &mut Formatter<'_>) -> Result {
+        // The leader locates an implicit branch; it is not the final 3D curve.
+        // A caller must materialize and certify that boundary before export.
+        Err(std::fmt::Error)
     }
 }
 
@@ -433,36 +427,11 @@ where
     T0: StepLength + StepFormat,
     T1: StepLength + StepFormat,
 {
-    fn fmt(&self, idx: usize, f: &mut Formatter<'_>) -> Result {
-        // A guide cannot carry the selected branch in STEP's master 3D representation.
-        if !self.branch_halfspaces().is_empty() {
-            return Err(std::fmt::Error);
-        }
-        let curve_idx = idx + 1;
-        let boundary0_idx = curve_idx + self.leader().step_length();
-        let boundary1_idx = boundary0_idx + self.boundary0().map_or(0, StepLength::step_length);
-        let surface0_idx = boundary1_idx + self.boundary1().map_or(0, StepLength::step_length);
-        let surface1_idx = surface0_idx + self.surface0().step_length();
-        let assoc0 = self
-            .boundary0()
-            .map(|_| format!("#{boundary0_idx}"))
-            .unwrap_or_else(|| format!("#{surface0_idx}"));
-        let assoc1 = self
-            .boundary1()
-            .map(|_| format!("#{boundary1_idx}"))
-            .unwrap_or_else(|| format!("#{surface1_idx}"));
-        f.write_fmt(format_args!(
-            "#{idx} = INTERSECTION_CURVE('', #{curve_idx}, ({assoc0}, {assoc1}), .CURVE_3D.);\n"
-        ))?;
-        self.leader().fmt(curve_idx, f)?;
-        if let Some(boundary) = self.boundary0() {
-            boundary.fmt(boundary0_idx, f)?;
-        }
-        if let Some(boundary) = self.boundary1() {
-            boundary.fmt(boundary1_idx, f)?;
-        }
-        self.surface0().fmt(surface0_idx, f)?;
-        self.surface1().fmt(surface1_idx, f)
+    fn fmt(&self, _idx: usize, _f: &mut Formatter<'_>) -> Result {
+        // An implicit intersection leader is a search guide, even without
+        // branch halfspaces. It cannot be declared the STEP 3D authority.
+        // Callers must materialize a certified boundary before formatting.
+        Err(std::fmt::Error)
     }
 }
 
@@ -500,9 +469,26 @@ impl<C: StepCurve, S0, S1> StepCurve for IntersectionCurve<C, S0, S1> {
 impl<C, S> StepFormat for ParameterCurve<C, S>
 where
     C: StepFormat,
-    S: StepFormat + StepLength,
+    S: StepFormat + StepLength + StepSurface,
 {
+    fn fmt_on_surface(&self, idx: usize, surface_idx: usize, f: &mut Formatter<'_>) -> Result {
+        if !self.surface().preserves_parameterization() {
+            return Err(std::fmt::Error);
+        }
+        let repr_idx = idx + 1;
+        let context_idx = idx + 2;
+        let curve_idx = idx + 3;
+        f.write_fmt(format_args!(
+            "#{idx} = PCURVE('', #{surface_idx}, #{repr_idx});\n\
+#{repr_idx} = DEFINITIONAL_REPRESENTATION('', (#{curve_idx}), #{context_idx});\n\
+#{context_idx} = (GEOMETRIC_REPRESENTATION_CONTEXT(2) PARAMETRIC_REPRESENTATION_CONTEXT() REPRESENTATION_CONTEXT('2D SPACE', ''));\n"
+        ))?;
+        self.curve().fmt(curve_idx, f)
+    }
     fn fmt(&self, idx: usize, f: &mut Formatter<'_>) -> Result {
+        if !self.surface().preserves_parameterization() {
+            return Err(std::fmt::Error);
+        }
         let surface_idx = idx + 1;
         let repr_idx = surface_idx + self.surface().step_length();
         let context_idx = repr_idx + 1;
@@ -524,6 +510,7 @@ where
 
 impl<C: StepLength, S: StepLength> StepLength for ParameterCurve<C, S> {
     fn step_length(&self) -> usize { 3 + self.curve().step_length() + self.surface().step_length() }
+    fn step_length_on_surface(&self) -> usize { 3 + self.curve().step_length() }
 }
 
 impl<C, S> ConstStepLength for ParameterCurve<C, S>
@@ -631,7 +618,15 @@ impl StepFormat for Plane {
 }
 impl_const_step_length!(Plane, 5);
 
-impl StepSurface for Plane {}
+impl StepSurface for Plane {
+    fn preserves_parameterization(&self) -> bool {
+        // STEP placements use unit orthogonal axes, while a native plane may
+        // have a scaled/skew UV basis. Exact equality is intentionally required.
+        let x = self.axis_u().normalize();
+        let y = self.normal().cross(x).normalize();
+        self.axis_u() == x && self.axis_v() == y
+    }
+}
 
 impl StepFormat for Processor<Sphere, Matrix4> {
     fn fmt(&self, idx: usize, f: &mut Formatter<'_>) -> Result {
@@ -754,7 +749,9 @@ impl<P> StepLength for BsplineSurface<P> {
     #[inline(always)]
     fn step_length(&self) -> usize { 1 + self.control_points().iter().map(Vec::len).sum::<usize>() }
 }
-impl<P> StepSurface for BsplineSurface<P> {}
+impl<P> StepSurface for BsplineSurface<P> {
+    fn preserves_parameterization(&self) -> bool { true }
+}
 
 impl<V> StepFormat for NurbsSurface<V>
 where
@@ -816,7 +813,9 @@ impl<V> StepLength for NurbsSurface<V> {
     #[inline(always)]
     fn step_length(&self) -> usize { 1 + self.control_points().iter().map(Vec::len).sum::<usize>() }
 }
-impl<V> StepSurface for NurbsSurface<V> {}
+impl<V> StepSurface for NurbsSurface<V> {
+    fn preserves_parameterization(&self) -> bool { true }
+}
 
 impl<C> StepFormat for ExtrusionSurface<C, Vector3>
 where C: StepLength + StepFormat
@@ -1043,4 +1042,44 @@ impl StepLength for ModelingSurface {
     }
 }
 
-impl StepSurface for ModelingSurface {}
+impl StepSurface for ModelingSurface {
+    fn same_sense(&self) -> bool {
+        match self {
+            ModelingSurface::RevolutionSurface(surface)
+                if cylindrical_surface_from_revolution(surface).is_some() =>
+            {
+                let ModelingCurve::Line(profile) = surface.entity().entity_curve() else {
+                    // The cylinder recognizer requires this exact variant.
+                    return true;
+                };
+                let advance = (profile.1 - profile.0).dot(surface.entity().axis());
+                // Native parameters are (profile, angle), giving an inward
+                // cross product for positive axial profile advance. STEP
+                // cylinder parameters are (angle, height), pointing outward.
+                // Reflection and processor UV transposition each reverse
+                // the native orientation; neither changes STEP's outward
+                // cylinder normal in its emitted world placement.
+                ((advance < 0.) != (surface.transform().determinant() < 0.))
+                    == surface.orientation()
+            }
+            ModelingSurface::RevolutionSurface(surface)
+                if surface.try_into_homogeneous_bspline_surface().is_none() =>
+            {
+                // The generic STEP revolution exchanges the two native
+                // parameter directions. A reflected placement reverses its
+                // angular direction as well.
+                (surface.transform().determinant() < 0.) == surface.orientation()
+            }
+            // These serializers emit the actual transformed/oriented rational
+            // net, or a native plane; their carrier normals already agree.
+            _ => true,
+        }
+    }
+    fn preserves_parameterization(&self) -> bool {
+        match self {
+            ModelingSurface::Plane(plane) => plane.preserves_parameterization(),
+            ModelingSurface::BsplineSurface(_) | ModelingSurface::NurbsSurface(_) => true,
+            _ => false,
+        }
+    }
+}

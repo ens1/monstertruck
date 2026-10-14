@@ -320,6 +320,9 @@ impl<P, C, S> Shell<P, C, S> {
     ///     })
     /// })
     /// ```
+    // Face equality and hashing use only the stable Arc address and orientation.
+    // Interior geometry mutation changes neither, and borrowed keys cannot invert.
+    #[allow(clippy::mutable_key_type)]
     pub fn face_adjacency(&self) -> FaceAdjacencyMap<'_, P, C, S> {
         let mut edge_face_map = EntryMap::new(|edge: &Edge<P, C>| edge.id(), |_| Vec::new());
         self.face_iter().for_each(|face| {
@@ -461,6 +464,9 @@ impl<P, C, S> Shell<P, C, S> {
     /// assert!(shell.is_connected());
     /// assert_eq!(shell.connected_components().len(), 2);
     /// ```
+    // The adjacency keys hash the Arc address and immutable borrowed orientation;
+    // their interior geometry never participates in Hash or Eq.
+    #[allow(clippy::mutable_key_type)]
     pub fn connected_components(&self) -> Vec<Shell<P, C, S>> {
         let mut adjacency = self.face_adjacency();
         // Seed each component in shell order: draining the adjacency map from

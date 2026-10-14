@@ -3,6 +3,22 @@ use thiserror::Error;
 /// Topological Errors
 #[derive(Debug, PartialEq, Eq, Error)]
 pub enum Error {
+    /// A serialized topology reference is outside its source collection.
+    #[error("Invalid {kind} index {index}; the collection contains {length} elements.")]
+    InvalidIndex {
+        /// Referenced topology collection.
+        kind: &'static str,
+        /// Invalid zero-based index.
+        index: usize,
+        /// Size of the referenced collection.
+        length: usize,
+    },
+    /// Face-local trim storage does not match the face's boundary uses.
+    #[error("Face-local trim storage does not match its boundary wires and edges.")]
+    TrimLayout,
+    /// Serialized stable topology metadata is malformed or exhausted.
+    #[error("Malformed stable topology metadata: {0}.")]
+    StableIdMetadata(&'static str),
     /// Two same vertices cannot construct an edge.
     /// # Examples
     /// ```
