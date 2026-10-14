@@ -228,26 +228,11 @@ pub(super) fn curve2d_from_sampled_boundary(points: Vec<Point2>) -> Option<Curve
 }
 
 pub(super) fn same_surface(lhs: &Surface, rhs: &Surface) -> bool {
-    if std::mem::discriminant(lhs) != std::mem::discriminant(rhs) {
-        false
-    } else if content_hash64(lhs) == content_hash64(rhs) {
-        true
-    } else if let (Some((lu0, lu1)), Some((lv0, lv1)), Some((ru0, ru1)), Some((rv0, rv1))) = (
-        lhs.try_range_tuple().0,
-        lhs.try_range_tuple().1,
-        rhs.try_range_tuple().0,
-        rhs.try_range_tuple().1,
-    ) {
-        [(0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (1.0, 1.0), (0.5, 0.5)]
-            .into_iter()
-            .all(|(s, t)| {
-                let lp = lhs.evaluate(lu0 + (lu1 - lu0) * s, lv0 + (lv1 - lv0) * t);
-                let rp = rhs.evaluate(ru0 + (ru1 - ru0) * s, rv0 + (rv1 - rv0) * t);
-                lp.near(&rp)
-            })
-    } else {
-        false
-    }
+    // Membership and exact UV reuse require the same native carrier frame.
+    // Five matching points cannot establish a surface identity, nor show that
+    // different knot domains have the same parameterization between them.
+    std::mem::discriminant(lhs) == std::mem::discriminant(rhs)
+        && content_hash64(lhs) == content_hash64(rhs)
 }
 
 pub(super) fn exact_line_boundary(
