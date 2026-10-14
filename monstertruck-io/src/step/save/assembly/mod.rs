@@ -244,9 +244,7 @@ impl ConstStepLength for EdgeDisplay<'_> {
 
 impl StepLength for EdgeDisplay<'_> {
     #[inline]
-    fn step_length(&self) -> usize {
-        Self::LENGTH
-    }
+    fn step_length(&self) -> usize { Self::LENGTH }
 }
 
 /// Complete STEP product representation derived from an [`Assembly`].
@@ -305,9 +303,7 @@ impl<Model, Models, Matrix> StepDesign<Model, Models, Matrix> {
 
     /// Returns the length unit and distance accuracy written into the preamble.
     #[inline]
-    pub fn measurement_context(&self) -> StepMeasurementContext {
-        self.measurement_context
-    }
+    pub fn measurement_context(&self) -> StepMeasurementContext { self.measurement_context }
 }
 
 impl<Model> StepDesign<Model, Option<Model>, Matrix4> {
