@@ -32,6 +32,7 @@ mod content_hash;
 mod curve;
 mod domain_projection;
 mod parameter_curves;
+mod parameter_lift;
 mod surface;
 
 pub use curve::{Conic2D, Curve, Curve2D};

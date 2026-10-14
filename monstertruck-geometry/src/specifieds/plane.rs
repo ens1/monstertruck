@@ -13,6 +13,9 @@ impl Plane {
     /// Returns the origin
     #[inline(always)]
     pub const fn origin(&self) -> Point3 { self.o }
+    /// Returns the original three defining points without rounded axis subtraction.
+    #[inline(always)]
+    pub const fn defining_points(&self) -> [Point3; 3] { [self.o, self.p, self.q] }
     /// Returns the u-axis
     #[inline(always)]
     pub fn axis_u(&self) -> Vector3 { self.p - self.o }
