@@ -4,14 +4,47 @@
 
 use super::*;
 
-fn to_modeling_trim(
+/// Convert a parameter boundary only with a known map between carrier frames.
+/// A same-locus rational surface conversion alone does not preserve its UVs.
+fn modeling_parameter_curve(
     curve: &StepParameterCurve,
-) -> std::result::Result<ParameterCurve<ModelingCurve2D, Box<ModelingSurface>>, StepConvertingError>
-{
-    Ok(ParameterCurve::new(
-        curve.curve().as_ref().try_into()?,
-        Box::new(curve.surface().as_ref().try_into()?),
-    ))
+) -> std::result::Result<ModelingCurve, StepConvertingError> {
+    let mut uv = curve.curve().as_ref().clone();
+    let surface = match curve.surface().as_ref() {
+        Surface::ElementarySurface(ElementarySurface::Sphere(sphere))
+            if ROUTE_ANALYTIC_SPHERE && analytic_sphere_is_representable(&sphere.entity().0) => {
+                // Processor inversion transposes both frames. In the forward
+                // frame STEP (longitude, latitude) -> (colatitude, longitude).
+                let transform = if sphere.orientation() {
+                    Matrix3::from_cols(
+                        Vector3::new(0.0, 1.0, 0.0),
+                        Vector3::new(-1.0, 0.0, 0.0),
+                        Vector3::new(std::f64::consts::FRAC_PI_2, 0.0, 1.0),
+                    )
+                } else {
+                    Matrix3::from_cols(
+                        Vector3::new(0.0, -1.0, 0.0),
+                        Vector3::new(1.0, 0.0, 0.0),
+                        Vector3::new(0.0, std::f64::consts::FRAC_PI_2, 1.0),
+                    )
+                };
+                uv.transform_by(transform);
+                ModelingSurface::SphericalSurface(sphere.map_ref(|sphere| sphere.0))
+            }
+        Surface::ElementarySurface(
+            ElementarySurface::Plane(_)
+            | ElementarySurface::CylindricalSurface(_)
+            | ElementarySurface::ConicalSurface(_)
+            | ElementarySurface::ToroidalSurface(_),
+        ) | Surface::BsplineSurface(_) | Surface::NurbsSurface(_) => {
+            curve.surface().as_ref().try_into()?
+        }
+        _ => return Err("STEP parameter boundary carrier has no proven parameter-preserving modeling conversion.".into()),
+    };
+    Ok(ModelingCurve::ParameterCurve(ParameterCurve::new(
+        (&uv).try_into()?,
+        Box::new(surface),
+    )))
 }
 
 impl TryFrom<&Curve3D> for ModelingCurve {
@@ -21,43 +54,16 @@ impl TryFrom<&Curve3D> for ModelingCurve {
             Curve3D::Line(line) => Ok((*line).into()),
             Curve3D::BsplineCurve(curve) => Ok(curve.clone().into()),
             Curve3D::NurbsCurve(curve) => Ok(curve.clone().into()),
-            Curve3D::ParameterCurve(curve) => {
-                Ok(ModelingCurve::ParameterCurve(ParameterCurve::new(
-                    curve.curve().as_ref().try_into()?,
-                    Box::new(curve.surface().as_ref().try_into()?),
-                )))
-            }
+            Curve3D::ParameterCurve(curve) => modeling_parameter_curve(curve),
             Curve3D::SurfaceCurve(curve) => {
-                let surfaces = curve
-                    .associated_geometry()
-                    .iter()
-                    .map(SurfaceCurveAssociatedGeometry::surface)
-                    .collect::<Vec<_>>();
-                if surfaces.len() >= 2 {
-                    let surface0 = surfaces[0].try_into()?;
-                    let surface1 = surfaces[1].try_into()?;
-                    let boundary0 = curve
-                        .parameter_curve_on(surfaces[0])
-                        .cloned()
-                        .map(|trim| to_modeling_trim(&trim))
-                        .transpose()?;
-                    let boundary1 = curve
-                        .parameter_curve_on(surfaces[1])
-                        .cloned()
-                        .map(|trim| to_modeling_trim(&trim))
-                        .transpose()?;
-                    Ok(ModelingCurve::IntersectionCurve(
-                        SurfaceCurve::with_boundaries(
-                            Box::new(surface0),
-                            Box::new(surface1),
-                            Box::new(curve.leader().try_into()?),
-                            boundary0,
-                            boundary1,
-                        ),
-                    ))
-                } else {
-                    curve.leader().try_into()
+                // A STEP association is not an instruction to solve a new
+                // implicit intersection. Preserve the declared 3D authority.
+                // Parameter-master edges need synchronized trimming before
+                // handing their different parameter domain to the modeler.
+                if curve.master_representation() != SurfaceCurveRepresentation::Curve3D {
+                    return Err("STEP parameter-master boundary needs parameter-domain-preserving conversion.".into());
                 }
+                curve.leader().try_into()
             }
             Curve3D::IntersectionCurve(curve) => Ok(ModelingCurve::IntersectionCurve(
                 SurfaceCurve::with_boundaries(

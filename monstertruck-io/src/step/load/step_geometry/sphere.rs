@@ -6,7 +6,7 @@ impl ParametricSurface for Sphere {
     type Vector = Vector3;
     #[inline]
     fn derivative_mn(&self, m: usize, n: usize, u: f64, v: f64) -> Self::Vector {
-        self.0.derivative_mn(m, n, PI / 2.0 - v, u) * (-1f64).powi(m as i32)
+        self.0.derivative_mn(n, m, PI / 2.0 - v, u) * if n.is_multiple_of(2) { 1.0 } else { -1.0 }
     }
     #[inline]
     fn evaluate(&self, u: f64, v: f64) -> Point3 { self.0.evaluate(PI / 2.0 - v, u) }
@@ -44,7 +44,7 @@ impl SearchNearestParameter<SurfaceParameter> for Sphere {
         trials: usize,
     ) -> Option<(f64, f64)> {
         self.0
-            .search_nearest_parameter(point, hint, trials)
+            .search_nearest_parameter(point, native_hint(hint.into()), trials)
             .map(|(u, v)| (v, PI / 2.0 - u))
     }
 }
@@ -58,7 +58,7 @@ impl SearchParameter<SurfaceParameter> for Sphere {
         trials: usize,
     ) -> Option<(f64, f64)> {
         self.0
-            .search_parameter(point, hint, trials)
+            .search_parameter(point, native_hint(hint.into()), trials)
             .map(|(u, v)| (v, PI / 2.0 - u))
     }
 }
@@ -71,8 +71,16 @@ impl ParameterDivision2D for Sphere {
     ) -> (Vec<f64>, Vec<f64>) {
         let range = ((PI / 2.0 - v1, PI / 2.0 - v0), (u0, u1));
         let (udiv0, vdiv0) = self.0.parameter_division(range, tol);
-        let vdiv = udiv0.into_iter().map(|u| PI / 2.0 - u).collect();
+        let vdiv = udiv0.into_iter().rev().map(|u| PI / 2.0 - u).collect();
         (vdiv0, vdiv)
+    }
+}
+
+fn native_hint(hint: SearchParameterHint2D) -> SearchParameterHint2D {
+    match hint {
+        SearchParameterHint2D::Parameter(u, v) => (PI / 2.0 - v, u).into(),
+        SearchParameterHint2D::Range(u, v) => ((PI / 2.0 - v.1, PI / 2.0 - v.0), u).into(),
+        SearchParameterHint2D::None => SearchParameterHint2D::None,
     }
 }
 

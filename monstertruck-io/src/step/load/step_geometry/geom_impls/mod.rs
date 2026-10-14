@@ -1,7 +1,5 @@
 //! STEP geometry conversions, split by the kind of carrier being
-//! converted. The private inherent helpers on
-//! [`SurfaceCurveAssociatedGeometry`] live here because two of the parts
-//! below need them.
+//! converted. Shared private association helpers live here.
 
 use super::*;
 use monstertruck_geometry::prelude::{
@@ -22,15 +20,6 @@ use web_time::Instant;
 
 #[cfg(test)]
 use std::f64::consts::TAU;
-
-impl SurfaceCurveAssociatedGeometry {
-    fn surface(&self) -> &Surface {
-        match self {
-            SurfaceCurveAssociatedGeometry::ParameterCurve(curve) => curve.surface().as_ref(),
-            SurfaceCurveAssociatedGeometry::Surface(surface) => surface,
-        }
-    }
-}
 
 impl SurfaceCurveAssociatedGeometry {
     fn split_at(&mut self, t: f64) -> Self {
